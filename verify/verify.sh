@@ -192,7 +192,9 @@ check_hardening_static() {
 # ── compose shape ────────────────────────────────────────────────────────────
 check_compose_static() {
   sect "compose, read"
-  [ -f "$COMPOSE" ] || { bad "file:$COMPOSE" "missing"; return; }
+  # the caller already reported a missing compose file via need_file; reporting it
+  # again here would duplicate the check id and double-count the failure
+  [ -f "$COMPOSE" ] || return
   docker compose -f "$COMPOSE" config -q >/dev/null 2>&1 \
     && ok "compose:valid" "$COMPOSE parses" || bad "compose:valid" "$COMPOSE does not parse"
   grep -qE '^[[:space:]]*volumes:' "$COMPOSE" \
@@ -346,10 +348,14 @@ case "$SECTION" in
     if run_stack; then check_postgres_backed; check_persistence; fi
     ;;
   wiremock)
+    sect "the files"
+    need_file "$COMPOSE"
     check_compose_static
     run_stack && check_wiremock
     ;;
   networks)
+    sect "the files"
+    need_file "$COMPOSE"
     check_compose_static
     run_stack && check_networks
     ;;
