@@ -80,7 +80,13 @@ run_image() {
 
 # ── starting it: the Compose stack ───────────────────────────────────────────
 # Used by the sections that are about COMPOSITION.
+#
+# run_stack [service] — with a service name, ONLY that service is asked for.
+# Compose then starts whatever it depends on and nothing else, so asking for the
+# app alone is a behavioural test of the dependency graph: if the student never
+# declared one, the database simply does not come up.
 run_stack() {
+  local target="${1:-}"
   sect "build and start the stack"
   [ -f .env ] || { cp .env.example .env 2>/dev/null \
     && warn "run:env" "no .env — copied .env.example for this run"; }
@@ -90,10 +96,10 @@ run_stack() {
   fi
   ok "stack:build" "the stack builds"
 
-  if ! docker compose -f "$COMPOSE" up -d >/tmp/cu.$$ 2>&1; then
-    bad "stack:up" "compose up failed"; tail -15 /tmp/cu.$$ >&2; return 1
+  if ! docker compose -f "$COMPOSE" up -d $target >/tmp/cu.$$ 2>&1; then
+    bad "stack:up" "compose up ${target:-} failed"; tail -15 /tmp/cu.$$ >&2; return 1
   fi
-  ok "stack:up" "the stack starts"
+  ok "stack:up" "${target:+asked for '$target' only; }the stack starts"
 
   if ! wait_up 90; then
     bad "stack:health" "no answer on $BASE/health after 90s"
@@ -102,6 +108,8 @@ run_stack() {
   ok "stack:health" "/health answers"
   return 0
 }
+
+running_services() { docker compose -f "$COMPOSE" ps --services --status running 2>/dev/null; }
 
 # ── compose file shape · shared by the compose/wiremock/networks sections ────
 check_compose_shape() {

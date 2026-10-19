@@ -10,20 +10,15 @@ section_run() {
   check_compose_shape
   [ -f "$COMPOSE" ] || return
 
-  # the shape the lesson turns on
-  grep -qE '^[[:space:]]*volumes:' "$COMPOSE" \
-    && ok  "compose:volumes" "volumes declared" \
-    || bad "compose:volumes" "no volumes: — the data dies with the container"
-
-  grep -q 'healthcheck:' "$COMPOSE" \
-    && ok  "compose:healthcheck" "healthcheck present" \
-    || bad "compose:healthcheck" "no healthcheck on the database"
-
-  # depends_on alone waits for the container to start, not for Postgres to accept
-  # connections. Without the gate the app must retry — and ours does.
-  grep -q 'service_healthy' "$COMPOSE" \
-    && ok   "compose:gate" "depends_on gated on service_healthy" \
-    || warn "compose:gate" "no service_healthy gate — the app must then retry, and ours does"
+  # the two service names are a stated contract, because the checks address them
+  local svcs
+  svcs="$(docker compose -f "$COMPOSE" config --services 2>/dev/null)"
+  printf '%s\n' "$svcs" | grep -qx app \
+    && ok  "compose:service-app" "a service named 'app'" \
+    || bad "compose:service-app" "no service named 'app' — the brief fixes that name"
+  printf '%s\n' "$svcs" | grep -qx db \
+    && ok  "compose:service-db" "a service named 'db'" \
+    || bad "compose:service-db" "no service named 'db' — the brief fixes that name"
 
   local dbports
   dbports="$(grep -nE '^[[:space:]]*-[[:space:]]*"?[0-9.]*:?[0-9]*:?5432' "$COMPOSE" || true)"
@@ -35,7 +30,16 @@ section_run() {
     warn "compose:dbport" "database on loopback only — fine for debugging, say so in the pull request"
   fi
 
-  run_stack || return
+  # Ask for the app and nothing else. Compose starts what it depends on, so this is
+  # a behavioural test of the dependency graph rather than a grep for depends_on.
+  run_stack app || return
+
+  sect "did asking for the app bring the database?"
+  if running_services | grep -qx db; then
+    ok "stack:graph" "'up app' started the database too — the dependency is declared"
+  else
+    bad "stack:graph" "'up app' did not start the database — nothing in compose.yaml says the app needs it"
+  fi
 
   sect "the counter lives in Postgres"
   local store v1 v2 before after
@@ -51,10 +55,18 @@ section_run() {
     bad "stack:visits" "/visits does not increment (got '$v1' then '$v2')"
   fi
 
+  # The persistence test only means something once the counter is actually reaching
+  # the database. Running it anyway would report "no named volume" at a student whose
+  # real problem is upstream, and send them to the wrong file.
+  if [ -z "${v2:-}" ] || [ "${v2:-0}" -le "${v1:-0}" ]; then
+    warn "persist:volume" "not tested — /visits is not counting yet, so fix that first"
+    return
+  fi
+
   sect "does the data survive down/up?"
   before="${v2:-0}"
   docker compose -f "$COMPOSE" down >/dev/null 2>&1
-  docker compose -f "$COMPOSE" up -d >/dev/null 2>&1
+  docker compose -f "$COMPOSE" up -d app >/dev/null 2>&1
   if wait_up 90; then
     after="$(visits)"
     if [ -n "${after:-}" ] && [ "${after:-0}" -gt "${before:-0}" ]; then
