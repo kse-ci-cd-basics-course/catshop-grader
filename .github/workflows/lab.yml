@@ -1,0 +1,98 @@
+# Reusable workflow — grade a whole lab in one call.
+#
+# Use this when you do not want to write a job per section by hand:
+#
+#   jobs:
+#     lab-01:
+#       uses: kse-ci-cd-basics-course/catshop-grader/.github/workflows/lab.yml@v1
+#       with:
+#         path: lab-01
+#         required: "dockerfile,hardening,compose"
+#         bonus: "wiremock,networks"
+#
+# Each section still becomes its own check, because the matrix fans out into one job
+# per section. Bonus sections run in a separate matrix with continue-on-error.
+name: lab
+
+on:
+  workflow_call:
+    inputs:
+      path:
+        description: "The lab folder to grade, e.g. lab-01"
+        required: true
+        type: string
+      required:
+        description: "Comma-separated sections that must pass"
+        required: false
+        type: string
+        default: "dockerfile,hardening,compose"
+      bonus:
+        description: "Comma-separated sections that may fail without failing the lab"
+        required: false
+        type: string
+        default: ""
+      port:
+        description: "Host port the app is expected on"
+        required: false
+        type: string
+        default: "8080"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.split.outputs.required }}
+      bonus: ${{ steps.split.outputs.bonus }}
+      has_bonus: ${{ steps.split.outputs.has_bonus }}
+    steps:
+      - id: split
+        shell: bash
+        run: |
+          # a comma-separated input becomes a JSON array the matrix can consume
+          to_json() {
+            printf '%s' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep . \
+              | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))'
+          }
+          req="$(to_json "${{ inputs.required }}")"
+          bon="$(to_json "${{ inputs.bonus }}" || true)"
+          [ -n "$bon" ] || bon='[]'
+          echo "required=$req" >> "$GITHUB_OUTPUT"
+          echo "bonus=$bon"    >> "$GITHUB_OUTPUT"
+          [ "$bon" = '[]' ] && echo "has_bonus=false" >> "$GITHUB_OUTPUT" \
+                            || echo "has_bonus=true"  >> "$GITHUB_OUTPUT"
+
+  required:
+    needs: plan
+    name: "section · ${{ matrix.section }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # one broken section must not hide the others
+      matrix:
+        section: ${{ fromJSON(needs.plan.outputs.required) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: kse-ci-cd-basics-course/catshop-grader/verify@v1
+        with:
+          section: ${{ matrix.section }}
+          path: ${{ inputs.path }}
+          port: ${{ inputs.port }}
+
+  bonus:
+    needs: plan
+    if: needs.plan.outputs.has_bonus == 'true'
+    name: "section · ${{ matrix.section }} (bonus)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        section: ${{ fromJSON(needs.plan.outputs.bonus) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: kse-ci-cd-basics-course/catshop-grader/verify@v1
+        with:
+          section: ${{ matrix.section }}
+          path: ${{ inputs.path }}
+          port: ${{ inputs.port }}

@@ -1,0 +1,52 @@
+name: "Catshop verify"
+description: "Grade one section of one catshop lab and report it as a named check."
+author: "KSE · CI/CD and Cloud Deployment"
+
+inputs:
+  section:
+    description: >-
+      Which section to grade: dockerfile | hardening | compose | wiremock | networks.
+    required: true
+  path:
+    description: >-
+      The lab folder to grade, relative to the repository root (e.g. lab-01).
+      Defaults to the repository root.
+    required: false
+    default: "."
+  port:
+    description: >-
+      The host port the app is expected on. The compose sections must publish 8080,
+      because that is what the reference compose.yaml publishes.
+    required: false
+    default: "8080"
+
+outputs:
+  pass:
+    description: "Number of checks that passed."
+    value: ${{ steps.verify.outputs.pass }}
+  fail:
+    description: "Number of checks that failed. Zero means the section is clean."
+    value: ${{ steps.verify.outputs.fail }}
+  warn:
+    description: "Number of judgement calls to explain in the pull request."
+    value: ${{ steps.verify.outputs.warn }}
+  score:
+    description: "Passed checks as a percentage of decided checks."
+    value: ${{ steps.verify.outputs.score }}
+
+runs:
+  using: composite
+  steps:
+    - name: "Grade section ${{ inputs.section }}"
+      id: verify
+      shell: bash
+      env:
+        PORT: ${{ inputs.port }}
+      run: |
+        # The checkout must be unshallow enough for the .env history check to mean
+        # anything. actions/checkout defaults to depth 1, so deepen it here rather
+        # than making every student remember fetch-depth.
+        git -C "$GITHUB_WORKSPACE" fetch --unshallow --quiet 2>/dev/null || true
+        bash "${{ github.action_path }}/verify.sh" \
+          --section "${{ inputs.section }}" \
+          --path "${{ inputs.path }}"
