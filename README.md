@@ -103,15 +103,14 @@ meaningless.
 
 ---
 
-## Running it locally
+## Running it
 
-Students get a wrapper in their own repository:
+**Students are graded in the pipeline, and only there.** They are not given a local wrapper: one
+place decides a section, so there is no second path that can disagree with the mark. Pushing is
+free and reports the same table, so there is nothing to gain from a local run.
 
-```bash
-./scripts/verify.sh --section dockerfile --path lab-01
-```
-
-Or run this repository directly:
+This repository is public, so the checks are readable by anyone who wants to know exactly what is
+asserted — which is the point. To run it by hand while authoring or debugging a lab:
 
 ```bash
 git clone https://github.com/kse-ci-cd-basics-course/catshop-grader
