@@ -45,12 +45,11 @@ done
 if [ -z "$SECTION" ]; then
   echo "--section is required. Available:" >&2
   for f in "$SECTIONS"/*.sh; do
-    b="$(basename "$f" .sh)"; [ "$b" = secrets ] && continue
-    echo "  $b" >&2
+    echo "  $(basename "$f" .sh)" >&2
   done
   exit 2
 fi
-if [ ! -f "$SECTIONS/$SECTION.sh" ] || [ "$SECTION" = secrets ]; then
+if [ ! -f "$SECTIONS/$SECTION.sh" ]; then
   echo "unknown section '$SECTION'" >&2; exit 2
 fi
 
@@ -61,14 +60,14 @@ if [ -n "$WORKDIR" ]; then
 fi
 
 export JSON KEEP
-# shellcheck source=lib.sh
-. "$HERE/lib.sh"          # needs JSON/KEEP/PORT set, and the working directory final
+# shellcheck source=../../common/lib.sh
+. "$HERE/../../common/lib.sh"          # needs JSON/KEEP/PORT set, and the working directory final
 trap cleanup EXIT
 
 # shellcheck source=/dev/null
 . "$SECTIONS/$SECTION.sh"     # defines section_run
-# shellcheck source=sections/secrets.sh
-. "$SECTIONS/secrets.sh"      # defines check_secrets
+# shellcheck source=../../common/secrets.sh
+. "$HERE/../../common/secrets.sh"      # defines check_secrets
 
 log "${B}catshop lab 1 · section: $SECTION${N}"
 section_run
