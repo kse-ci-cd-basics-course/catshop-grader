@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: kse-ci-cd-basics-course/catshop-grader/verify@v1
+      - uses: kse-ci-cd-basics-course/catshop-grader/lab-01@v1
         with:
           section: dockerfile
           path: lab-01
@@ -51,7 +51,7 @@ on:
 
 jobs:
   lab-01:
-    uses: kse-ci-cd-basics-course/catshop-grader/.github/workflows/lab.yml@v1
+    uses: kse-ci-cd-basics-course/catshop-grader/.github/workflows/lab-01.yml@v1
     with:
       path: lab-01
       required: "dockerfile,hardening,compose"
@@ -72,7 +72,7 @@ Both produce one named check per section. Pick whichever you prefer — **the ma
 | Input | Required | Default | Meaning |
 |---|---|---|---|
 | `section` | yes | — | `dockerfile`, `hardening`, `compose`, `wiremock` or `networks` |
-| `path` | no | `.` | the lab folder to grade, e.g. `lab-01` |
+| `path` | no | `lab-01` | the lab folder to grade |
 | `port` | no | `8080` | the host port the app must be published on |
 
 Outputs: `pass`, `fail`, `warn`, `score`. `fail` is zero when the section is clean.
@@ -115,7 +115,7 @@ Or run this repository directly:
 
 ```bash
 git clone https://github.com/kse-ci-cd-basics-course/catshop-grader
-bash catshop-grader/verify/verify.sh --section compose --path lab-01
+bash catshop-grader/lab-01/verify/verify.sh --section compose --path lab-01
 ```
 
 Flags: `--json` for machine-readable output, `--keep` to leave the stack running for inspection,
@@ -164,6 +164,27 @@ git tag -f v1 && git push -f origin v1
 Re-point `v1` only for fixes that make the grader *more correct*. A change that makes a previously
 passing solution fail mid-lab is a new tag, not a `v1` move.
 
-Both sections of the grader were verified against the reference solutions in
-[`catshop-examples`](https://github.com/kse-ci-cd-basics-course/catshop-examples) before release —
-17, 16 and 18 checks green respectively, and the no-volume variant correctly fails `persist:volume`.
+Every section was verified against the reference solutions in
+[`catshop-examples`](https://github.com/kse-ci-cd-basics-course/catshop-examples) before release:
+`dockerfile` 17, `hardening` 15, `compose` 18, `wiremock` 12, `networks` 14 — all clean. The
+no-volume compose variant correctly fails `persist:volume`, so the grader can fail as well as pass.
+
+## Layout
+
+```
+lab-01/
+├── action.yml              the composite action students reference
+└── verify/
+    ├── verify.sh           entry point: flags, dispatch, report
+    ├── lib.sh              counters, output, and the two ways to start the app
+    └── sections/
+        ├── dockerfile.sh   section 1
+        ├── hardening.sh    section 2
+        ├── compose.sh      section 3
+        ├── wiremock.sh     bonus
+        ├── networks.sh     bonus
+        └── secrets.sh      runs in every section
+```
+
+One folder per lab. Lab 2's checks will land in `lab-02/` beside this one, referenced as
+`catshop-grader/lab-02@v1` — same repository, same tag, no new repository per lab.

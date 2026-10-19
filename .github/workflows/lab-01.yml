@@ -1,26 +1,25 @@
-# Reusable workflow — grade a whole lab in one call.
-#
-# Use this when you do not want to write a job per section by hand:
+# Reusable workflow — grade all of lab 1 in one call.
 #
 #   jobs:
 #     lab-01:
-#       uses: kse-ci-cd-basics-course/catshop-grader/.github/workflows/lab.yml@v1
+#       uses: kse-ci-cd-basics-course/catshop-grader/.github/workflows/lab-01.yml@v1
 #       with:
-#         path: lab-01
 #         required: "dockerfile,hardening,compose"
 #         bonus: "wiremock,networks"
 #
-# Each section still becomes its own check, because the matrix fans out into one job
-# per section. Bonus sections run in a separate matrix with continue-on-error.
-name: lab
+# Each section still becomes its own named check: the matrix fans out into one job
+# per section. There is one of these per lab, because `uses:` cannot take an
+# expression — a lab-agnostic workflow could not choose its action path.
+name: lab-01
 
 on:
   workflow_call:
     inputs:
       path:
-        description: "The lab folder to grade, e.g. lab-01"
-        required: true
+        description: "The lab folder to grade"
+        required: false
         type: string
+        default: "lab-01"
       required:
         description: "Comma-separated sections that must pass"
         required: false
@@ -30,7 +29,7 @@ on:
         description: "Comma-separated sections that may fail without failing the lab"
         required: false
         type: string
-        default: ""
+        default: "wiremock,networks"
       port:
         description: "Host port the app is expected on"
         required: false
@@ -47,19 +46,21 @@ jobs:
     steps:
       - id: split
         shell: bash
+        env:
+          REQUIRED: ${{ inputs.required }}
+          BONUS: ${{ inputs.bonus }}
         run: |
-          # a comma-separated input becomes a JSON array the matrix can consume
+          # a comma-separated input becomes the JSON array a matrix can consume
           to_json() {
-            printf '%s' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep . \
+            printf '%s' "$1" | tr ',' '\n' \
               | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))'
           }
-          req="$(to_json "${{ inputs.required }}")"
-          bon="$(to_json "${{ inputs.bonus }}" || true)"
-          [ -n "$bon" ] || bon='[]'
+          req="$(to_json "$REQUIRED")"
+          bon="$(to_json "$BONUS")"
           echo "required=$req" >> "$GITHUB_OUTPUT"
           echo "bonus=$bon"    >> "$GITHUB_OUTPUT"
-          [ "$bon" = '[]' ] && echo "has_bonus=false" >> "$GITHUB_OUTPUT" \
-                            || echo "has_bonus=true"  >> "$GITHUB_OUTPUT"
+          if [ "$bon" = '[]' ]; then echo "has_bonus=false" >> "$GITHUB_OUTPUT"
+          else                       echo "has_bonus=true"  >> "$GITHUB_OUTPUT"; fi
 
   required:
     needs: plan
@@ -72,7 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: kse-ci-cd-basics-course/catshop-grader/verify@v1
+      - uses: kse-ci-cd-basics-course/catshop-grader/lab-01@v1
         with:
           section: ${{ matrix.section }}
           path: ${{ inputs.path }}
@@ -91,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: kse-ci-cd-basics-course/catshop-grader/verify@v1
+      - uses: kse-ci-cd-basics-course/catshop-grader/lab-01@v1
         with:
           section: ${{ matrix.section }}
           path: ${{ inputs.path }}

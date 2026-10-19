@@ -1,5 +1,5 @@
-name: "Catshop verify"
-description: "Grade one section of one catshop lab and report it as a named check."
+name: "Catshop lab 1 · verify"
+description: "Grade one section of lab 1 (containers and the image) and report it as a named check."
 author: "KSE · CI/CD and Cloud Deployment"
 
 inputs:
@@ -10,9 +10,8 @@ inputs:
   path:
     description: >-
       The lab folder to grade, relative to the repository root (e.g. lab-01).
-      Defaults to the repository root.
     required: false
-    default: "."
+    default: "lab-01"
   port:
     description: >-
       The host port the app is expected on. The compose sections must publish 8080,
@@ -43,10 +42,10 @@ runs:
       env:
         PORT: ${{ inputs.port }}
       run: |
-        # The checkout must be unshallow enough for the .env history check to mean
-        # anything. actions/checkout defaults to depth 1, so deepen it here rather
-        # than making every student remember fetch-depth.
+        # One check asks whether .env was EVER committed. actions/checkout clones a
+        # single commit by default, which would make that check meaningless — so
+        # deepen here rather than relying on every student remembering fetch-depth.
         git -C "$GITHUB_WORKSPACE" fetch --unshallow --quiet 2>/dev/null || true
-        bash "${{ github.action_path }}/verify.sh" \
+        bash "${{ github.action_path }}/verify/verify.sh" \
           --section "${{ inputs.section }}" \
           --path "${{ inputs.path }}"
