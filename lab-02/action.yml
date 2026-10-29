@@ -1,0 +1,49 @@
+name: "Catshop lab 2 · verify"
+description: "Grade one section of lab 2 (test, build, publish) and report it as a named check."
+author: "KSE · CI/CD and Cloud Deployment"
+
+inputs:
+  section:
+    description: >-
+      Which section to grade: tests | pipeline | published-image | cache.
+    required: true
+  path:
+    description: >-
+      The lab folder to grade, relative to the repository root (e.g. lab-02).
+    required: false
+    default: "lab-02"
+  port:
+    description: >-
+      The host port the published image is expected to serve on.
+    required: false
+    default: "8080"
+
+outputs:
+  pass:
+    description: "Number of checks that passed."
+    value: ${{ steps.verify.outputs.pass }}
+  fail:
+    description: "Number of checks that failed. Zero means the section is clean."
+    value: ${{ steps.verify.outputs.fail }}
+  warn:
+    description: "Number of judgement calls to explain in the pull request."
+    value: ${{ steps.verify.outputs.warn }}
+  score:
+    description: "Passed checks as a percentage of decided checks."
+    value: ${{ steps.verify.outputs.score }}
+
+runs:
+  using: composite
+  steps:
+    - name: "Grade section ${{ inputs.section }}"
+      id: verify
+      shell: bash
+      env:
+        PORT: ${{ inputs.port }}
+      run: |
+        # published-image reads the revision label and asks git whether that
+        # commit exists here, so a single-commit clone would make it meaningless
+        git -C "$GITHUB_WORKSPACE" fetch --unshallow --quiet 2>/dev/null || true
+        bash "${{ github.action_path }}/verify/verify.sh" \
+          --section "${{ inputs.section }}" \
+          --path "${{ inputs.path }}"
