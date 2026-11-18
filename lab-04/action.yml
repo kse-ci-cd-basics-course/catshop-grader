@@ -6,6 +6,8 @@ inputs:
   section:
     description: >-
       Which section to grade: stack | drift | cloud-plan | deployed.
+      `stack` accepts EITHER path: the stack applied here with the state kept
+      off the runner, or a real deployment answering on a published URL.
     required: true
   path:
     description: >-

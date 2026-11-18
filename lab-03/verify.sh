@@ -97,15 +97,19 @@ gh_api() {
 
 api_code() { cat "$API_CODE_FILE" 2>/dev/null; }
 
+# The JSON goes in on stdin, never as an argument: one argument may be at most
+# 128 KB on Linux (MAX_ARG_STRLEN), and the runs API answers a busy repository
+# with far more. As an argument it died with "Argument list too long", stderr
+# went to /dev/null, and the caller read the empty result as "you have no runs".
 jq_py() {   # jq_py <json> <python expression over `d`>
-  python3 - "$1" "$2" <<'PYEOF' 2>/dev/null
+  printf '%s' "$1" | python3 -c '
 import json, sys
 try:
-    d = json.loads(sys.argv[1])
+    d = json.load(sys.stdin)
 except Exception:
     d = {}
-print(eval(sys.argv[2], {"d": d, "sorted": sorted, "len": len, "next": next, "str": str, "set": set}))
-PYEOF
+print(eval(sys.argv[1], {"d": d, "sorted": sorted, "len": len, "next": next, "str": str, "set": set}))
+' "$2" 2>/dev/null
 }
 
 

@@ -233,6 +233,45 @@ except Exception:
 PYEOF
 }
 
+
+# ── which of the two paths was taken ─────────────────────────────────────────
+#
+# The lab accepts either proof, and they are not the same work:
+#
+#   local   the stack really applies here, and the state is kept somewhere that
+#           outlives the runner
+#   remote  it is deployed on their own account and answers on a public URL
+#
+# A published URL is the signal, because it is the thing only the remote path
+# can produce. Nothing asks the student to declare which one they chose.
+chosen_path() {
+  [ -s "$DEPLOYDIR/url.txt" ] && { echo remote; return; }
+  echo local
+}
+
+# The state has to outlive the job on the local path, or "No changes." is a
+# sentence that can never be true and half the lesson is missing.
+check_remote_state() {
+  if ! read_tf "$TFDIR"; then
+    bad "state:read" "no .tf files under $TFDIR/"
+    return
+  fi
+  if tf_true "re.search(r'(?m)^\\s*(cloud|backend)\\s', body_of('terraform')) is not None"; then
+    ok "state:not-local" "the state is configured to live off this machine"
+  else
+    bad "state:not-local" "no cloud or backend block — with the state beside the configuration every run starts from nothing"
+    return
+  fi
+  # Second plan on an unchanged world must be empty. This is the whole point of
+  # keeping the state, and it cannot be faked by a configuration that works.
+  tf "$TFDIR" plan -detailed-exitcode -input=false -no-color >/dev/null 2>&1
+  case $? in
+    0) ok "state:no-changes" "a second plan reports no changes — the state remembered" ;;
+    2) bad "state:no-changes" "a second plan still wants to create things — the state did not survive the first apply" ;;
+    *) bad "state:no-changes" "terraform plan failed — $(tf_tail)" ;;
+  esac
+}
+
 # ── section: stack ───────────────────────────────────────────────────────────
 #
 # The configuration is graded twice over: once as text, because some of the
@@ -240,6 +279,11 @@ PYEOF
 # literal, a template that follows `count`), and once by running it, because
 # the rest of the lesson is invisible in the text.
 section_stack() {
+  if [ "$(chosen_path)" = remote ]; then
+    sect "section stack — deployed, on your own account"
+    section_deployed_core
+    return
+  fi
   sect "section stack — a load balancer, two replicas, one database"
 
   need_file "$TFDIR/main.tf"
@@ -313,18 +357,29 @@ section_stack() {
     return
   fi
 
-  # Twenty separate connections. Two distinct answers means there really are two
-  # backends and something in front choosing between them.
-  local seen i who
-  seen=""
-  for i in $(seq 1 20); do
-    who=$(json_field "$(hit "$URL/whoami")" instance)
-    [ -n "$who" ] && seen="$seen$who"$'\n'
+  # Separate connections, because keep-alive pins the client to whichever backend
+  # answered first and a correct two-replica stack then looks like one.
+  #
+  # This RETRIES for up to 45s, and that is not padding. A proxy with
+  # max_fails set will exclude a backend that failed once — including one that
+  # was merely slow to start — and let it back in after fail_timeout. Measured
+  # on a clean apply: all requests hit a single replica for the first ~30s,
+  # then settled to an even split. A fixed loop straight after /health answers
+  # fails a correct configuration.
+  local seen i who distinct=0 waited=0
+  while [ "$waited" -lt 45 ]; do
+    seen=""
+    for i in $(seq 1 12); do
+      who=$(json_field "$(hit "$URL/whoami")" instance)
+      [ -n "$who" ] && seen="$seen$who"$'\n'
+    done
+    distinct=$(printf '%s' "$seen" | sort -u | grep -c . || true)
+    [ "${distinct:-0}" -ge 2 ] && break
+    sleep 5
+    waited=$((waited+5))
   done
-  local distinct
-  distinct=$(printf '%s' "$seen" | sort -u | grep -c . || true)
   if [ "${distinct:-0}" -ge 2 ]; then
-    ok "run:replicas" "$distinct distinct replicas answered across 20 requests"
+    ok "run:replicas" "$distinct distinct replicas answered (settled after ${waited}s)"
   elif [ "${distinct:-0}" = 1 ]; then
     bad "run:replicas" "every request reached the same copy — one replica, or the pool has one entry"
   else
@@ -347,6 +402,9 @@ section_stack() {
     bad "run:shared-state" "the count did not advance across requests — each copy is keeping its own"
   fi
 
+  # ---- and whether anything was remembered ---------------------------------
+  check_remote_state
+
   # ---- and what it takes away ----------------------------------------------
   if tf "$TFDIR" destroy -auto-approve -input=false -no-color; then
     APPLIED=0
@@ -360,6 +418,16 @@ section_stack() {
     fi
   else
     bad "tf:destroy" "terraform destroy failed — $(tf_tail)"
+  fi
+}
+
+# The remote path, as graded by `stack`. Identical checks to the bonus, so the
+# two paths are marked on the same scale rather than on sympathy.
+section_deployed_core() {
+  section_deployed
+  if [ -d "$CLOUDDIR" ] || [ -d "$DEPLOYDIR" ]; then
+    read_tf "$DEPLOYDIR" || read_tf "$CLOUDDIR" || true
+    cloud_checks
   fi
 }
 
@@ -422,10 +490,10 @@ section_drift() {
   done
   if [ "$good" = 20 ]; then
     ok "drift:still-serving" "20 of 20 requests answered with one replica down"
-  elif [ "$good" -ge 15 ]; then
-    warn "drift:still-serving" "$good of 20 answered — explain the misses in the pull request"
+  elif [ "$good" -ge 17 ]; then
+    warn "drift:still-serving" "$good of 20 answered — the misses are the window before the proxy excluded the dead backend; say so in the pull request"
   else
-    bad "drift:still-serving" "$good of 20 answered — a dead backend should be skipped, not served"
+    bad "drift:still-serving" "$good of 20 answered — a stopped container does not refuse connections, it stops answering. Without proxy_connect_timeout the failover you configured never runs in time"
   fi
 
   # -detailed-exitcode: 0 no changes, 1 error, 2 changes. The wrapper that
@@ -474,6 +542,95 @@ print(n)')
   fi
 }
 
+
+# ── the cloud assertions, shared by cloud-plan and the remote path ───────────
+#
+# Which cloud is detected from the resource types, never asked for. The shared
+# checks are the architecture; after them each cloud gets the two or three
+# traps that are only traps on that cloud.
+cloud_checks() {
+  local cloud
+  cloud=$(tfq "'google' if resources(r'^google_') else ('aws' if resources(r'^aws_') else ('azure' if resources(r'^azurerm_') else 'other'))")
+  ok "cloud:provider" "reading this as ${cloud}"
+
+  tf_true "len(resources(r'(load_?balancer|_lb$|_alb|forwarding_rule|target_pool|loadbalancer)')) >= 1" \
+    && ok "cloud:load-balancer" "a load balancer is declared" \
+    || bad "cloud:load-balancer" "no load balancer resource — that is the way in"
+
+  tf_true "len(resources(r'(instance|server|droplet|virtual_machine|_vm$)')) - len(resources(r'(sql|database|_db_|rdb|postgres|mysql)')) >= 1" \
+    && ok "cloud:compute" "compute is declared" \
+    || bad "cloud:compute" "no instance, server or droplet — nothing is running the image"
+
+  tf_true "any(re.search(r'(?m)^\\s*(count|target_size|node_count|desired_capacity|instance_count|min_size)\\s*=\\s*2', b['body']) for b in resources(r'(instance|server|droplet|virtual_machine|group)')) or len(resources(r'(^aws_instance$|^google_compute_instance$|^hcloud_server$|^digitalocean_droplet$)')) >= 2" \
+    && ok "cloud:two" "there are two of them" \
+    || bad "cloud:two" "one instance is not redundancy — declare two, by count or by group size"
+
+  tf_true "len(resources(r'(sql_database_instance|db_instance|rds|database_cluster|rdb_instance|postgresql|mysql_)')) >= 1" \
+    && ok "cloud:database" "a managed database is declared" \
+    || bad "cloud:database" "no managed database"
+
+  tf_true "re.search(r'/health', d['text']) is not None and re.search(r'health', d['text'], re.I) is not None" \
+    && ok "cloud:health-check" "a health check is declared against /health" \
+    || bad "cloud:health-check" "declare the health check, and point it at /health"
+
+  case "$cloud" in
+    google)
+      # Health checks arrive from two fixed Google ranges, never from the load
+      # balancer. Miss them and every backend is unhealthy with nothing in any log.
+      tf_true "'35.191.0.0/16' in d['text'] and '130.211.0.0/22' in d['text']" \
+        && ok "gcp:health-ranges" "the firewall allows 35.191.0.0/16 and 130.211.0.0/22" \
+        || bad "gcp:health-ranges" "nothing allows Google's health-check ranges — every backend will be unhealthy and no log will say why"
+
+      tf_true "len(resources(r'^google_compute_firewall$')) >= 1" \
+        && ok "gcp:firewall" "firewall rules are declared" \
+        || bad "gcp:firewall" "no google_compute_firewall — the network denies ingress by default"
+
+      # A private Cloud SQL address needs a peering, and it is the resource
+      # nobody draws.
+      if tf_true "len(resources(r'^google_sql_database_instance$')) >= 1"; then
+        tf_true "len(resources(r'^google_service_networking_connection$')) >= 1 or 'ipv4_enabled' in d['text']" \
+          && ok "gcp:db-reachable" "the database's addressing is declared" \
+          || warn "gcp:db-reachable" "a private Cloud SQL address needs google_service_networking_connection — say how yours is reached"
+      fi
+
+      tf_true "len(resources(r'^google_compute_router_nat$')) == 0" \
+        && ok "gcp:no-nat" "no Cloud NAT" \
+        || warn "gcp:no-nat" "Cloud NAT is ~\$33 a month — justify it in COST.md, or give the instances public addresses"
+      ;;
+    aws)
+      # An ALB will not create at all with one subnet, and the error arrives at
+      # apply rather than at plan.
+      tf_true "len(resources(r'^aws_subnet$')) >= 2 or any('subnets' in b['body'] for b in resources(r'^aws_lb$'))" \
+        && ok "aws:two-subnets" "more than one subnet — an ALB needs at least two, in different zones" \
+        || bad "aws:two-subnets" "an ALB requires subnets in two availability zones and will not create with one"
+
+      tf_true "len(resources(r'^aws_lb_target_group$')) >= 1" \
+        && ok "aws:target-group" "a target group is declared" \
+        || bad "aws:target-group" "no aws_lb_target_group — that is the pool"
+
+      tf_true "len(resources(r'^aws_lb_listener$')) >= 1" \
+        && ok "aws:listener" "a listener is declared" \
+        || bad "aws:listener" "no aws_lb_listener — nothing is listening on the load balancer"
+
+      tf_true "len(resources(r'^aws_security_group$')) >= 1" \
+        && ok "aws:security-group" "security groups are declared" \
+        || bad "aws:security-group" "no security group — the instances accept nothing, including the load balancer"
+
+      tf_true "len(resources(r'nat_gateway')) == 0" \
+        && ok "aws:no-nat" "no NAT gateway" \
+        || bad "aws:no-nat" "a NAT gateway is ~\$32 a month PER ZONE that nobody in this exercise chose"
+      ;;
+  esac
+
+  local ndata
+  ndata=$(tfq "len(blocks('data'))")
+  if [ "${ndata:-0}" != "0" ]; then
+    warn "cloud:data-sources" "$ndata data source(s) — say how each resolves without an API call"
+  else
+    ok "cloud:data-sources" "nothing has to be looked up to read this file"
+  fi
+}
+
 # ── section: cloud-plan ──────────────────────────────────────────────────────
 #
 # Same architecture, written for a cloud, graded without an account. `validate`
@@ -504,45 +661,7 @@ section_cloud_plan() {
     bad "cloud:validate" "terraform validate failed — $(tf_tail)"
   fi
 
-  # Provider-agnostic on purpose: the resource TYPE is the only handle that
-  # works for six clouds, so the checks match families of names.
-  tf_true "len(resources(r'(load_?balancer|_lb$|_alb|forwarding_rule|target_pool|loadbalancer)')) >= 1" \
-    && ok "cloud:load-balancer" "a load balancer is declared" \
-    || bad "cloud:load-balancer" "no load balancer resource — that is the way in"
-
-  tf_true "len(resources(r'(instance|server|droplet|virtual_machine|_vm$)')) - len(resources(r'(sql|database|_db_|rdb|postgres|mysql)')) >= 1" \
-    && ok "cloud:compute" "compute is declared" \
-    || bad "cloud:compute" "no instance, server or droplet — nothing is running the image"
-
-  tf_true "any(re.search(r'(?m)^\\s*(count|target_size|node_count|desired_capacity|instance_count|server_count)\\s*=\\s*2', b['body']) for b in resources(r'(instance|server|droplet|virtual_machine|group)')) or len(resources(r'(^aws_instance$|^google_compute_instance$|^hcloud_server$|^digitalocean_droplet$|^scaleway_instance_server$)')) >= 2" \
-    && ok "cloud:two" "there are two of them" \
-    || bad "cloud:two" "one instance is not redundancy — declare two, by count or by group size"
-
-  tf_true "len(resources(r'(sql_database_instance|db_instance|rds|database_cluster|rdb_instance|postgresql|mysql_|_database$)')) >= 1" \
-    && ok "cloud:database" "a managed database is declared" \
-    || bad "cloud:database" "no managed database — pick a cloud that has one (AWS, Google, Azure, DigitalOcean, Scaleway)"
-
-  tf_true "len(resources(r'nat_gateway')) == 0" \
-    && ok "cloud:no-nat" "no NAT gateway" \
-    || bad "cloud:no-nat" "a NAT gateway is ~\$32 a month that nobody in this lab chose"
-
-  tf_true "re.search(r'health', d['text'], re.I) is not None and '/health' in d['text']" \
-    && ok "cloud:health-check" "a health check is declared against /health" \
-    || bad "cloud:health-check" "declare the health check, and point it at /health"
-
-  tf_true "re.search(r'(?m)^\\s*backend\\s+\"', body_of('terraform')) is not None" \
-    && ok "cloud:backend" "a backend block is written down" \
-    || bad "cloud:backend" "no backend block — say where the state would live, even though nothing here uses it"
-
-  # A data source that has to ask the cloud a question cannot be checked by
-  # anybody without an account. That is a judgement call, so it warns.
-  local ndata
-  ndata=$(tfq "len(blocks('data'))")
-  if [ "${ndata:-0}" != "0" ]; then
-    warn "cloud:data-sources" "$ndata data source(s) — say in the pull request how each resolves without an API call"
-  else
-    ok "cloud:data-sources" "nothing has to be looked up to read this file"
-  fi
+  cloud_checks
 
   # COST.md is a third of the point: a declared architecture you cannot price is
   # an architecture you have not understood.
