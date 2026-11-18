@@ -119,7 +119,38 @@ def body_of(type_, label0=None):
     return "\n".join(b["body"] for b in blocks(type_, label0))
 
 
-env = {"d": d, "re": re, "blocks": blocks, "resources": resources,
+SIZE = r"(?m)^\s*(count|target_size|node_count|desired_capacity|instance_count|min_size)\s*=\s*(\S+)"
+
+
+def var_default(name):
+    """The value a variable falls back to, as written."""
+    for b in blocks("variable", name):
+        m = re.search(r"(?m)^\s*default\s*=\s*(\S+)", b["body"])
+        if m:
+            return m.group(1).strip().strip('"')
+    return None
+
+
+def two_of_them():
+    """Two instances, however they were asked for.
+
+    `target_size = 2` and `target_size = var.replicas` with a default of 2 are
+    the same declaration, and the second one is the better written of the two.
+    """
+    for b in resources(r"(instance|server|droplet|virtual_machine|group)"):
+        for _kw, val in re.findall(SIZE, b["body"]):
+            val = val.strip().rstrip(",")
+            if val == "2":
+                return True
+            m = re.fullmatch(r"var\.([A-Za-z_][A-Za-z0-9_]*)", val)
+            if m and var_default(m.group(1)) == "2":
+                return True
+    singles = resources(r"(^aws_instance$|^google_compute_instance$|^hcloud_server$|^digitalocean_droplet$)")
+    return len(singles) >= 2
+
+
+env = {"d": d, "re": re, "blocks": blocks, "resources": resources, "two_of_them": two_of_them,
+       "var_default": var_default,
        "body_of": body_of, "len": len, "any": any, "all": all, "sorted": sorted,
        "set": set, "str": str, "int": int, "sum": sum, "max": max}
 try:
@@ -557,11 +588,11 @@ cloud_checks() {
     && ok "cloud:load-balancer" "a load balancer is declared" \
     || bad "cloud:load-balancer" "no load balancer resource — that is the way in"
 
-  tf_true "len(resources(r'(instance|server|droplet|virtual_machine|_vm$)')) - len(resources(r'(sql|database|_db_|rdb|postgres|mysql)')) >= 1" \
+  tf_true "len([b for b in resources(r'(instance|server|droplet|virtual_machine|_vm$)') if not re.search(r'(sql|database|rds|rdb|postgres|mysql)', b['labels'][0])]) >= 1" \
     && ok "cloud:compute" "compute is declared" \
     || bad "cloud:compute" "no instance, server or droplet — nothing is running the image"
 
-  tf_true "any(re.search(r'(?m)^\\s*(count|target_size|node_count|desired_capacity|instance_count|min_size)\\s*=\\s*2', b['body']) for b in resources(r'(instance|server|droplet|virtual_machine|group)')) or len(resources(r'(^aws_instance$|^google_compute_instance$|^hcloud_server$|^digitalocean_droplet$)')) >= 2" \
+  tf_true "two_of_them()" \
     && ok "cloud:two" "there are two of them" \
     || bad "cloud:two" "one instance is not redundancy — declare two, by count or by group size"
 
@@ -639,7 +670,14 @@ cloud_checks() {
 section_cloud_plan() {
   sect "section cloud-plan — the same three things, rented"
 
-  need_file "$CLOUDDIR/main.tf"
+  # Any .tf file will do: splitting network, compute and the load balancer into
+  # separate files is better practice than one main.tf, and the first version of
+  # this check failed a configuration for being well organised.
+  if compgen -G "$CLOUDDIR/*.tf" >/dev/null 2>&1; then
+    ok "file:$CLOUDDIR/*.tf" "$(ls "$CLOUDDIR"/*.tf | wc -l | tr -d ' ') file(s)"
+  else
+    bad "file:$CLOUDDIR/*.tf" "no .tf files under $CLOUDDIR/"
+  fi
   need_file "$CLOUDDIR/variables.tf"
   need_file COST.md
 
