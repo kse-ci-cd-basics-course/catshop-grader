@@ -6,6 +6,7 @@
 #   ./tests/run.sh graph        the workflow analyser's verdicts on the fixtures
 #   ./tests/run.sh sections     every lab-3 section, on the good fixture and the bad one
 #   ./tests/run.sh lab2         lab 2 grades the student's pipeline, not an earlier lab's
+#   ./tests/run.sh yamlless     a grader with no PyYAML blames itself, not the student
 #   ./tests/run.sh api          the checks that call GitHub, with curl stubbed
 #
 # Nothing here needs a network, a token or a registry. Two things therefore
@@ -135,13 +136,41 @@ api() {
   echo "  (read the counts: a case named for a failure must show fail=1)"
 }
 
+# ── the grader without PyYAML blames itself, not the student ────────────────
+# The bug: the pinned Python had no PyYAML, so every workflow "did not parse".
+yamlless() {
+  echo "== no PyYAML on the runner"
+  local work out
+  work="$(mktemp -d)"
+  mkdir -p "$work/.github/workflows" "$work/lab-02" "$work/lab-03"
+  cat > "$work/.github/workflows/lab-02.yml" <<'YML'
+name: lab 2
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: pytest lab-02/tests -q
+YML
+  out=$( cd "$work" && PYYAML="" bash "$GR/lab-02/verify.sh" --section pipeline --path lab-02 2>&1 )
+  grep -q 'pipeline:grader' <<<"$out" && ok "lab 2 names the grader" || fail "lab 2 said: $(grep -m1 FAIL <<<"$out")"
+  grep -q 'does not parse as YAML' <<<"$out" && fail "lab 2 still blames the student's YAML" || ok "lab 2 does not blame the student's YAML"
+
+  cp "$work/.github/workflows/lab-02.yml" "$work/.github/workflows/lab-03-pipeline.yml"
+  out=$( cd "$work" && PYYAML="" bash "$GR/lab-03/verify.sh" --section reuse --path lab-03 2>&1 )
+  grep -q 'grader:yaml' <<<"$out" && ok "lab 3 names the grader" || fail "lab 3 said: $(grep -m1 FAIL <<<"$out")"
+  [ "$(grep -c 'grader:yaml' <<<"$out")" = 1 ] && ok "lab 3 says it once" || fail "lab 3 repeats it"
+  rm -rf "$work"
+}
+
 case "${1:-all}" in
   graph)    graph ;;
   sections) sections ;;
   lab2)     lab2pipeline ;;
+  yamlless) yamlless ;;
   api)      api ;;
-  all)      graph; sections; lab2pipeline; api ;;
-  *) echo "usage: run.sh [graph|sections|lab2|api]" >&2; exit 2 ;;
+  all)      graph; sections; lab2pipeline; yamlless; api ;;
+  *) echo "usage: run.sh [graph|sections|lab2|yamlless|api]" >&2; exit 2 ;;
 esac
 
 echo

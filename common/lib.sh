@@ -16,6 +16,19 @@ else
   G=; R=; Y=; D=; B=; N=
 fi
 
+# ── which interpreter can read YAML ──────────────────────────────────────────
+# The pinned Python has no PyYAML; the system one does. Pick whichever can.
+pick_pyyaml() {
+  local c
+  for c in python3 /usr/bin/python3 python; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    "$c" -c 'import yaml' >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+# PYYAML="" before sourcing = pretend none can; the tests rely on it.
+if [ -z "${PYYAML+set}" ]; then PYYAML="$(pick_pyyaml || true)"; fi
+
 log()  { [ "${JSON:-0}" = 1 ] || printf '%s\n' "$*"; }
 sect() { log ""; log "${B}$*${N}"; }
 ok()   { PASS=$((PASS+1)); RESULTS+=("PASS|$1|$2"); log "  ${G}PASS${N}  $1  ${D}$2${N}"; }

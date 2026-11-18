@@ -56,6 +56,11 @@ runs:
       with:
         python-version: "3.12"
 
+    # setup-python's interpreter has no PyYAML. Reported 2026-11-18.
+    - name: "The grader's own dependencies"
+      shell: bash
+      run: python3 -m pip install --quiet --disable-pip-version-check pyyaml
+
     - name: "Grade section ${{ inputs.section }}"
       id: verify
       shell: bash

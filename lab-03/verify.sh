@@ -64,7 +64,13 @@ WFR=""            # the workflow report, read once and shared by the sections
 read_workflows() {
   [ -n "$WFR" ] && return 0
   [ -d "$WF" ] || return 1
-  WFR=$(python3 "$HERE/read_workflows.py" "$WF" "$ACT" 2>/dev/null)
+  # No PyYAML = every section would blame the student's workflow. Say it once.
+  if [ -z "${PYYAML:-}" ]; then
+    [ "${YAMLSAID:-0}" = 1 ] || bad "grader:yaml" "the grader has no PyYAML on this runner, so it cannot read any workflow — this is the course's bug, not yours; please report it"
+    YAMLSAID=1
+    return 1
+  fi
+  WFR=$("$PYYAML" "$HERE/read_workflows.py" "$WF" "$ACT" 2>/dev/null)
   [ -n "$WFR" ]
 }
 
@@ -538,7 +544,7 @@ qa_job_text() {
   local report="$1" site f j
   for site in $(grep '^QA ' <<<"$report" | sed 's/^QA //'); do
     f="${site%%:*}"; j="${site##*:}"
-    python3 - "$WF/$f" "$j" <<'PY' 2>/dev/null
+    "${PYYAML:-python3}" - "$WF/$f" "$j" <<'PY' 2>/dev/null
 import sys, yaml
 doc = yaml.safe_load(open(sys.argv[1], errors="replace").read()) or {}
 print(yaml.dump((doc.get("jobs") or {}).get(sys.argv[2], {})))

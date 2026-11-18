@@ -127,6 +127,12 @@ section_pipeline() {
   wfs=$(ls ../.github/workflows/*.yml ../.github/workflows/*.yaml 2>/dev/null)
   [ -n "$wfs" ] || { bad "pipeline:file" "no workflow under .github/workflows/"; return; }
 
+  # No PyYAML = every file "fails to parse", which blames the student.
+  if [ -z "${PYYAML:-}" ]; then
+    bad "pipeline:grader" "the grader has no PyYAML on this runner, so it cannot read any workflow — this is the course's bug, not yours; please report it"
+    return
+  fi
+
   # Grade the workflow that comes CLOSEST to what this section asks for, not the
   # first file that happens to say "docker": an earlier lab's workflow is still
   # in the repository, still mentions docker, and used to win on `head -1`.
@@ -136,7 +142,7 @@ section_pipeline() {
   for f in $wfs; do
     grep -q 'catshop-grader' "$f" && continue
     n=$((n + 1))
-    report=$(python3 "$HERE/read_workflow.py" "$f" 2>/dev/null) || continue
+    report=$("$PYYAML" "$HERE/read_workflow.py" "$f" 2>/dev/null) || continue
     [ -n "$report" ] || continue
     local score=0
     [ -n "$(sed -n 's/^TESTS //p'  <<<"$report")" ] && score=$((score + 1))
@@ -155,7 +161,7 @@ section_pipeline() {
     wf=$(for f in $wfs; do grep -q 'catshop-grader' "$f" || { echo "$f"; break; }; done)
     ok  "pipeline:file" "grading $(basename "$wf")"
     bad "pipeline:parses" "it does not parse as YAML"
-    python3 "$HERE/read_workflow.py" "$wf" 2>&1 >/dev/null | head -3 >&2
+    "$PYYAML" "$HERE/read_workflow.py" "$wf" 2>&1 >/dev/null | head -3 >&2
     return
   fi
 
