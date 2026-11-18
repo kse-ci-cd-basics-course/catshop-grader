@@ -1,0 +1,78 @@
+name: "Catshop lab 4 · verify"
+description: "Grade one section of lab 4 (the declared stack, drift, the cloud plan, and an optional real deployment) and report it as a named check."
+author: "KSE · CI/CD and Cloud Deployment"
+
+inputs:
+  section:
+    description: >-
+      Which section to grade: stack | drift | cloud-plan | deployed.
+    required: true
+  path:
+    description: >-
+      The lab folder to grade, relative to the repository root (e.g. lab-04).
+    required: false
+    default: "lab-04"
+  port:
+    description: >-
+      The host port the stack publishes the load balancer on. Left empty, the
+      grader picks a free one, which is what lets two sections run at once.
+    required: false
+    default: ""
+  terraform-version:
+    description: >-
+      The Terraform the grader runs. Pinned for the same reason the Python is:
+      a minor release that changes plan output changes everybody's mark.
+    required: false
+    default: "1.9.8"
+
+  bonus:
+    description: >-
+      true for a bonus section: it still reports every check, but it cannot
+      fail the job, because a bonus can only add marks.
+    required: false
+    default: "false"
+
+outputs:
+  pass:
+    description: "Number of checks that passed."
+    value: ${{ steps.verify.outputs.pass }}
+  fail:
+    description: "Number of checks that failed. Zero means the section is clean."
+    value: ${{ steps.verify.outputs.fail }}
+  warn:
+    description: "Number of judgement calls to explain in the pull request."
+    value: ${{ steps.verify.outputs.warn }}
+  score:
+    description: "Passed checks as a percentage of decided checks."
+    value: ${{ steps.verify.outputs.score }}
+
+runs:
+  using: composite
+  steps:
+    # The grader pins its own Python, for the same reason lab 3 does: the runner
+    # image's system Python moves, and the lab's wheels do not move with it.
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    # terraform_wrapper MUST stay off. The wrapper this action installs by
+    # default captures stdout and normalises the exit code, and the drift
+    # section reads `plan -detailed-exitcode`, where 2 is the answer.
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: "Grade section ${{ inputs.section }}"
+      id: verify
+      shell: bash
+      env:
+        PORT: ${{ inputs.port }}
+        GITHUB_SHA: ${{ github.sha }}
+      run: |
+        # the committed-state check reads git history, not the working tree
+        git -C "$GITHUB_WORKSPACE" fetch --unshallow --quiet 2>/dev/null || true
+        bash "${{ github.action_path }}/verify.sh" \
+          --section "${{ inputs.section }}" \
+          --path "${{ inputs.path }}" \
+          ${{ inputs.bonus == 'true' && '--bonus' || '' }}
