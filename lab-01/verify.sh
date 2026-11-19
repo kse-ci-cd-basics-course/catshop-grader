@@ -172,7 +172,7 @@ section_hardening() {
 
   sect "hardening, running"
   local uid sz ly
-  uid="$(docker run --rm "$IMG" id -u 2>/dev/null | tr -dc '0-9')"
+  uid="$(docker run --rm --entrypoint id "$IMG" -u 2>/dev/null | tr -dc '0-9')"
   if [ -n "${uid:-}" ] && [ "${uid:-0}" -ne 0 ]; then
     ok "run:nonroot" "the process runs as uid $uid"
   elif [ -n "${uid:-}" ]; then
