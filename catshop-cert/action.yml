@@ -1,0 +1,143 @@
+name: "Catshop · mint a certificate for this run"
+description: >-
+  Trade this run's GitHub OIDC token for a one-hour SSH certificate, and leave
+  DOCKER_HOST pointing at the student's own engine on the course VPS. No
+  long-lived key exists anywhere: the keypair is made here and dies with the
+  runner.
+
+# The caller must grant the token, or ACTIONS_ID_TOKEN_REQUEST_URL is unset and
+# the first curl fails with an empty URL:
+#
+#   permissions:
+#     id-token: write
+#     contents: read
+
+inputs:
+  signer:
+    description: "Base URL of the course signer, e.g. https://catshop.kse.dev"
+    required: true
+  audience:
+    description: >-
+      The audience the signer verifies. It must match on both sides, or the
+      signer answers 401 — a token minted for something else is not usable here.
+    required: false
+    default: "catshop-vps"
+  validate:
+    description: "Ask the engine for its version once, to prove the whole chain works."
+    required: false
+    default: "true"
+
+outputs:
+  user:
+    description: "The unix user the certificate is valid for."
+    value: ${{ steps.sign.outputs.user }}
+  login:
+    description: "The GitHub login the space belongs to — also its URL prefix."
+    value: ${{ steps.sign.outputs.login }}
+  port:
+    description: "The host port their load balancer publishes on, loopback-only."
+    value: ${{ steps.sign.outputs.port }}
+  docker_host:
+    description: "ssh://user@host — also exported as DOCKER_HOST and TF_VAR_docker_host."
+    value: ${{ steps.sign.outputs.docker_host }}
+  url:
+    description: "Where their stack answers from the outside."
+    value: ${{ steps.sign.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - id: sign
+      shell: bash
+      env:
+        SIGNER: ${{ inputs.signer }}
+        AUDIENCE: ${{ inputs.audience }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::no OIDC token available. Add 'permissions: id-token: write' to this job."
+          exit 1
+        fi
+
+        # 1 · the token. GitHub signs it; this job cannot choose its claims.
+        jwt=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+        [ -n "$jwt" ] && [ "$jwt" != null ] || { echo "::error::empty OIDC token"; exit 1; }
+
+        # 2 · a keypair for this run only.
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/catshop -C "run ${GITHUB_RUN_ID:-local}"
+
+        # 3 · trade both for a certificate. 403 means the roster does not list
+        #     this repository's owner — that is an instructor action, not a bug.
+        code=$(curl -sS -o /tmp/sign.json -w '%{http_code}' -X POST "${SIGNER%/}/sign" \
+                 -H "Authorization: Bearer $jwt" \
+                 -H "Content-Type: text/plain" \
+                 --data-binary @"$HOME/.ssh/catshop.pub")
+        if [ "$code" != 200 ]; then
+          echo "::error::signer answered $code: $(jq -r '.error // .detail // .' /tmp/sign.json 2>/dev/null || cat /tmp/sign.json)"
+          exit 1
+        fi
+
+        user=$(jq -r .user      /tmp/sign.json)
+        login=$(jq -r .login    /tmp/sign.json)
+        port=$(jq -r .port      /tmp/sign.json)
+        host=$(jq -r .host      /tmp/sign.json)
+        url=$(jq -r .url        /tmp/sign.json)
+        jq -r .cert             /tmp/sign.json > ~/.ssh/catshop-cert.pub
+
+        # 4 · the host key comes from the signer, over TLS. That is why no
+        #     KNOWN_HOSTS secret is needed, and why StrictHostKeyChecking stays
+        #     on: trust is bootstrapped from the certificate chain, not from
+        #     "yes" at a prompt.
+        jq -r '.host_key' /tmp/sign.json > ~/.ssh/known_hosts
+        chmod 600 ~/.ssh/known_hosts ~/.ssh/catshop
+        rm -f /tmp/sign.json
+
+        # 5 · the provider and the docker CLI both shell out to plain `ssh`, so
+        #     the identity has to be discoverable without extra flags.
+        cat >> ~/.ssh/config <<EOF
+        Host $host
+          User $user
+          IdentityFile ~/.ssh/catshop
+          CertificateFile ~/.ssh/catshop-cert.pub
+          UserKnownHostsFile ~/.ssh/known_hosts
+          StrictHostKeyChecking yes
+          BatchMode yes
+          IdentitiesOnly yes
+        EOF
+        chmod 600 ~/.ssh/config
+
+        docker_host="ssh://$user@$host"
+        {
+          echo "DOCKER_HOST=$docker_host"
+          echo "TF_VAR_docker_host=$docker_host"
+          echo "TF_VAR_port=$port"
+          # The stack must bind to loopback: Caddy is the only thing allowed to
+          # face the internet. And it must know its own public URL, because the
+          # `url` output is what every probe reads.
+          echo "TF_VAR_bind_ip=127.0.0.1"
+          echo "TF_VAR_public_url=$url"
+        } >> "$GITHUB_ENV"
+
+        for kv in "user=$user" "login=$login" "port=$port" \
+                  "docker_host=$docker_host" "url=$url"; do
+          echo "$kv" >> "$GITHUB_OUTPUT"
+        done
+
+        echo "certificate for $user, valid $(ssh-keygen -L -f ~/.ssh/catshop-cert.pub \
+                | sed -n 's/ *Valid: *//p')"
+
+    - if: inputs.validate == 'true'
+      shell: bash
+      env:
+        DOCKER_HOST: ${{ steps.sign.outputs.docker_host }}
+      run: |
+        # One call that exercises every link: ssh, the certificate, the forced
+        # command, the deploy semaphore, and the engine's API.
+        if ! out=$(docker version --format '{{.Server.Version}}' 2>&1); then
+          echo "::error::reached the box but the engine did not answer: $out"
+          exit 1
+        fi
+        echo "engine on the VPS answers: $out"
