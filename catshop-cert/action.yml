@@ -26,6 +26,17 @@ inputs:
     description: "Ask the engine for its version once, to prove the whole chain works."
     required: false
     default: "true"
+  wait_for_slot:
+    description: >-
+      Queue here, visibly, until the course server has a free deployment slot.
+      Without this the wait happens silently inside Terraform and looks like a
+      hang in the student's own configuration.
+    required: false
+    default: "true"
+  slot_timeout:
+    description: "Seconds to queue for a slot before failing with a clear message."
+    required: false
+    default: "900"
 
 outputs:
   user:
@@ -128,6 +139,46 @@ runs:
 
         echo "certificate for $user, valid $(ssh-keygen -L -f ~/.ssh/catshop-cert.pub \
                 | sed -n 's/ *Valid: *//p')"
+
+    - if: inputs.wait_for_slot == 'true'
+      name: "Wait for a free deployment slot"
+      shell: bash
+      env:
+        SIGNER: ${{ inputs.signer }}
+        TIMEOUT: ${{ inputs.slot_timeout }}
+      run: |
+        set -euo pipefail
+
+        # The server runs a fixed number of deployments at a time. Queueing
+        # HERE, in a step with its own name, is what makes the wait legible: a
+        # student sees a step called "Wait for a free deployment slot" counting
+        # down, instead of Terraform appearing to freeze on its first resource.
+        deadline=$(( $(date +%s) + TIMEOUT ))
+        while :; do
+          if ! out=$(curl -fsS --max-time 10 "${SIGNER%/}/slots" 2>/dev/null); then
+            echo "could not read the queue; going straight to the deployment"
+            exit 0
+          fi
+          free=$(jq -r .free <<<"$out"); total=$(jq -r .total <<<"$out")
+          if [ "${free:-0}" -gt 0 ]; then
+            echo "$free of $total deployment slots free - going ahead"
+            exit 0
+          fi
+          left=$(( deadline - $(date +%s) ))
+          if [ "$left" -le 0 ]; then
+            echo "::error title=Course server busy - not your code::All $total deployment slots on the course server have been busy for $((TIMEOUT / 60)) minutes. Nothing was created and your state is untouched. Re-run this job, and tell the instructor if it keeps happening."
+            {
+              echo "### Could not deploy: the course server was busy"
+              echo
+              echo "This is **not** a problem with your code."
+              echo "All $total deployment slots were in use for $((TIMEOUT / 60)) minutes."
+              echo "Nothing was created, nothing was broken. Re-run this job."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "all $total slots busy - ${left}s left to wait. The class is deploying; this is not your code."
+          sleep 15
+        done
 
     - if: inputs.validate == 'true'
       shell: bash
