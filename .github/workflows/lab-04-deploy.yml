@@ -275,11 +275,24 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          terraform plan -no-color -detailed-exitcode
-          rc=$?
+          terraform plan -no-color -detailed-exitcode 2>&1 | tee /tmp/second.plan
+          rc=${PIPESTATUS[0]}
           set -e
-          [ "$rc" = 0 ] || { echo "::error::a second plan still wants changes; this configuration is not convergent"; exit 1; }
-          echo "::notice::second plan is empty"
+          if [ "$rc" = 0 ]; then
+            echo "::notice::second plan is empty"
+            exit 0
+          fi
+          # A daemon-wide setting on the course server lands in the container's
+          # HostConfig, and Terraform reads it back as something to remove. That
+          # is the server's doing and no configuration can satisfy it, so it is
+          # named here rather than left to look like the student's mistake.
+          if grep -qE 'log_opts|log_driver.*forces replacement' /tmp/second.plan; then
+            echo "::error title=Not your code - the course server is editing your containers::The second plan wants to replace a container because of its LOG options, which the course server's docker daemon sets and your configuration cannot. Tell the instructor and quote this line. Nothing you wrote is wrong."
+            exit 1
+          fi
+          grep -E 'must be replaced|will be (created|destroyed|updated)|# forces replacement' /tmp/second.plan | head -20 || true
+          echo "::error::a second plan still wants changes; this configuration is not convergent"
+          exit 1
 
       - name: drift, and the plan that notices it
         if: inputs.drift_check && steps.mode.outputs.mode == 'apply'
