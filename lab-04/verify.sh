@@ -41,8 +41,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$SECTION" in
-  stack|drift|cloud-plan|deployed) : ;;
-  "") echo "--section is required: stack | drift | cloud-plan | deployed" >&2; exit 2 ;;
+  config|stack|drift|cloud-plan|deployed) : ;;
+  "") echo "--section is required: config | stack | drift | cloud-plan | deployed" >&2; exit 2 ;;
   *)  echo "unknown section '$SECTION'" >&2; exit 2 ;;
 esac
 
@@ -202,8 +202,14 @@ PYEOF
 # because each section is its own job and cannot inherit the other's containers.
 apply_stack() {
   local port
-  port="${PORT:-$(pick_port)}"
-  export TF_VAR_${VAR_HOST}="unix:///var/run/docker.sock"
+  # The course workflow has already exported TF_VAR_docker_host (an ssh:// URL
+  # for this run's certificate), TF_VAR_port and TF_VAR_bind_ip. Overriding them
+  # with a local socket, as this used to, would deploy the student's stack onto
+  # the runner instead of onto the server they were graded against.
+  port="${PORT:-${TF_VAR_port:-$(pick_port)}}"
+  : "${TF_VAR_docker_host:=unix:///var/run/docker.sock}"
+  : "${TF_VAR_bind_ip:=127.0.0.1}"
+  export TF_VAR_docker_host TF_VAR_bind_ip
   export TF_VAR_${VAR_PORT}="$port"
   export TF_IN_AUTOMATION=1
 
@@ -287,6 +293,12 @@ check_remote_state() {
     bad "state:read" "no .tf files under $TFDIR/"
     return
   fi
+  # `backend "local"` matched the old check and is exactly the thing the lesson
+  # is against, so the two cases are separated.
+  if tf_true "re.search(r'(?m)^\\s*backend\\s+\"local\"', body_of('terraform')) is not None"; then
+    bad "state:not-local" "backend \"local\" keeps the state beside the configuration — on a runner that is deleted, that is the same as no state"
+    return
+  fi
   if tf_true "re.search(r'(?m)^\\s*(cloud|backend)\\s', body_of('terraform')) is not None"; then
     ok "state:not-local" "the state is configured to live off this machine"
   else
@@ -309,26 +321,22 @@ check_remote_state() {
 # lesson is invisible at run time (a pinned provider, a password that is not a
 # literal, a template that follows `count`), and once by running it, because
 # the rest of the lesson is invisible in the text.
-section_stack() {
-  if [ "$(chosen_path)" = remote ]; then
-    sect "section stack — deployed, on your own account"
-    section_deployed_core
-    return
-  fi
-  sect "section stack — a load balancer, two replicas, one database"
-
+# Everything that can be judged from the files alone. Split out so it can be
+# graded without a server, a certificate or a state backend — which is what
+# lets the course's own CI check these rules against a known-good and a
+# known-broken configuration on every push.
+stack_text_checks() {
   need_file "$TFDIR/main.tf"
   need_file "$TFDIR/variables.tf"
   need_file "$TFDIR/outputs.tf"
+  need_file "$TFDIR/backend.tf"
   need_file "$TFDIR/nginx.conf.tftpl"
-  need_file Dockerfile
 
   if ! read_tf "$TFDIR"; then
     bad "tf:read" "no .tf files under $TFDIR/ — there is nothing to grade"
-    return
+    return 1
   fi
 
-  # ---- what the file says --------------------------------------------------
   tf_true 're.search(r"required_version", body_of("terraform")) is not None' \
     && ok "hcl:required-version" "the Terraform version is pinned" \
     || bad "hcl:required-version" "no required_version — the language itself is a dependency"
@@ -343,11 +351,15 @@ section_stack() {
 
   tf_true "re.search(r'var\\.', body_of('provider', 'docker')) is not None" \
     && ok "hcl:host-variable" "the daemon endpoint comes from a variable" \
-    || bad "hcl:host-variable" "provider \"docker\" must take host from a variable — a laptop path is not a default"
+    || bad "hcl:host-variable" "provider \"docker\" must take host from a variable — the course workflow sets TF_VAR_docker_host"
 
   tf_true "len(resources(r'^docker_network$')) >= 1" \
     && ok "hcl:network" "a docker_network is declared" \
     || bad "hcl:network" "no docker_network — the containers need a place to find each other by name"
+
+  tf_true "len(resources(r'^docker_volume$')) >= 1" \
+    && ok "hcl:volume" "a docker_volume is declared" \
+    || bad "hcl:volume" "no docker_volume — a volume is part of the place, and destroy has to take it away again"
 
   tf_true "any(re.search(r'(?m)^\\s*count\\s*=', b['body']) for b in resources(r'^docker_container$'))" \
     && ok "hcl:count" "the replicas come from one resource with count" \
@@ -357,13 +369,25 @@ section_stack() {
     && ok "hcl:templatefile" "the proxy configuration is rendered, not pasted" \
     || bad "hcl:templatefile" "nginx.conf.tftpl must be rendered with templatefile(...)"
 
-  tf_true "len(resources(r'^random_password$')) >= 1" \
-    && ok "hcl:random-password" "the database password is generated" \
-    || bad "hcl:random-password" "a literal password in the file is a password in the repository"
+  # This lab builds nothing. An image built here would put a Dockerfile, a
+  # build context and several minutes of CPU on a shared server for no lesson.
+  tf_true "not any(re.search(r'(?m)^\\s*build\\s*\\{', b['body']) for b in resources(r'^docker_image$'))" \
+    && ok "hcl:no-build" "no image is built — public images only in this lab" \
+    || bad "hcl:no-build" "a build block belongs to the next lab; use nginx:1.27-alpine with keep_locally"
+
+  # A port bound to every address on a shared machine bypasses the proxy that
+  # serves everyone's URL, and is reachable by anything that can route to the box.
+  tf_true "any(re.search(r'(?m)^\\s*ip\\s*=\\s*var\\.', b['body']) for b in resources(r'^docker_container$'))" \
+    && ok "hcl:bind-ip" "the published port is bound to the address the workflow gives you" \
+    || bad "hcl:bind-ip" "ports { ... ip = var.bind_ip } — on a shared server a container on 0.0.0.0 is a second front door"
 
   tf_true "len(resources(r'^(null_resource|terraform_data)$')) == 0 and re.search(r'local-exec|remote-exec', d['text']) is None" \
     && ok "hcl:no-shell" "nothing is created by shelling out" \
     || bad "hcl:no-shell" "local-exec, remote-exec or null_resource — that is a script wearing Terraform's coat"
+
+  tf_true "re.search(r'(?m)^\\s*output\\s+\"url\"', d['text']) is not None" \
+    && ok "hcl:output-url" "the stack's address comes out of terraform" \
+    || bad "hcl:output-url" "no output \"url\" — one grader reads thirty-two configurations and that name is fixed"
 
   # A template that names the backends by hand looks right and silently ignores
   # `count`, which is the single most common way to get this lab wrong.
@@ -375,33 +399,74 @@ section_stack() {
     fi
     grep -qiE 'upstream\s|proxy_pass' "$TFDIR/nginx.conf.tftpl" \
       && ok "tpl:upstream" "an upstream pool and a proxy_pass rule are present" \
-      || bad "tpl:upstream" "no upstream / proxy_pass — this file is the load balancer"
+      || bad "tpl:upstream" "no upstream / proxy_pass — this file is the proxy"
   fi
+  return 0
+}
+
+# ── section: config ──────────────────────────────────────────────────────────
+#
+# The text, and only the text. No apply, no server, no state.
+section_config() {
+  sect "section config — what the files say"
+  stack_text_checks || return
+  if ! read_tf "$TFDIR"; then return; fi
+  if tf_true "re.search(r'(?m)^\\s*backend\\s+\"local\"', body_of('terraform')) is not None"; then
+    bad "state:not-local" "backend \"local\" keeps the state beside the configuration — on a runner that is deleted, that is the same as no state"
+  elif tf_true "re.search(r'(?m)^\\s*cloud\\s*\\{', body_of('terraform')) is not None"; then
+    ok "state:cloud" "a cloud block is declared, so the state outlives the runner"
+  else
+    bad "state:cloud" "backend.tf must declare an empty cloud block, so the organization and workspace come from the environment"
+  fi
+}
+
+section_stack() {
+  if [ "$(chosen_path)" = remote ]; then
+    sect "section stack — deployed, on your own account"
+    section_deployed_core
+    return
+  fi
+  sect "section stack — a proxy, two replicas, a volume"
+
+  stack_text_checks || return
 
   # ---- what the file does --------------------------------------------------
   apply_stack || return
 
   if wait_for "$URL/health" 90; then
-    ok "run:health" "the stack answers /health through the load balancer"
+    ok "run:health" "the stack answers /health through the proxy"
   else
     bad "run:health" "nothing answered $URL/health within 90s"
     return
   fi
 
-  # Separate connections, because keep-alive pins the client to whichever backend
-  # answered first and a correct two-replica stack then looks like one.
+  # On the course server the URL is https://<host>/<github-login>/, and the
+  # login in it has to be the owner of the repository being graded. Otherwise a
+  # correct-looking run could be probing somebody else's stack.
+  if [ "${URL#https://}" != "$URL" ] && [ -n "${GITHUB_REPOSITORY_OWNER:-}" ]; then
+    if printf '%s' "$URL" | grep -qi "/${GITHUB_REPOSITORY_OWNER}/\?\$"; then
+      ok "run:own-url" "the URL belongs to $GITHUB_REPOSITORY_OWNER"
+    else
+      bad "run:own-url" "$URL is not this repository owner's address — a stack is graded at its own URL or not at all"
+    fi
+  fi
+
+  # Separate connections, because keep-alive pins the client to whichever
+  # backend answered first and a correct two-replica stack then looks like one.
   #
-  # This RETRIES for up to 45s, and that is not padding. A proxy with
-  # max_fails set will exclude a backend that failed once — including one that
-  # was merely slow to start — and let it back in after fail_timeout. Measured
-  # on a clean apply: all requests hit a single replica for the first ~30s,
-  # then settled to an even split. A fixed loop straight after /health answers
-  # fails a correct configuration.
+  # This RETRIES for up to 45s, and that is not padding. A proxy with max_fails
+  # set will exclude a backend that failed once — including one that was merely
+  # slow to start — and let it back in after fail_timeout. Measured on a clean
+  # apply: all requests hit a single replica for the first ~30s, then settled to
+  # an even split. A fixed loop straight after /health answers fails a correct
+  # configuration.
   local seen i who distinct=0 waited=0
   while [ "$waited" -lt 45 ]; do
     seen=""
     for i in $(seq 1 12); do
-      who=$(json_field "$(hit "$URL/whoami")" instance)
+      # nginx answers /whoami with its own $hostname, one bare line. No JSON,
+      # because this lab has no application in it.
+      who=$(hit "$URL/whoami" | tr -d '\r' | head -1)
       [ -n "$who" ] && seen="$seen$who"$'\n'
     done
     distinct=$(printf '%s' "$seen" | sort -u | grep -c . || true)
@@ -414,23 +479,7 @@ section_stack() {
   elif [ "${distinct:-0}" = 1 ]; then
     bad "run:replicas" "every request reached the same copy — one replica, or the pool has one entry"
   else
-    bad "run:replicas" "/whoami returned nothing — is the proxy forwarding to the app?"
-  fi
-
-  # Two replicas that do not share a database are two applications.
-  local v1 v2 store
-  v1=$(json_field "$(hit "$URL/visits")" visits)
-  v2=$(json_field "$(hit "$URL/visits")" visits)
-  store=$(json_field "$(hit "$URL/visits")" store)
-  if [ "$store" = "postgres" ]; then
-    ok "run:store" "the counter is in Postgres, not in a file inside a replica"
-  else
-    bad "run:store" "store is '${store:-unset}' — set DATABASE_URL so both copies count into the same place"
-  fi
-  if [ -n "$v1" ] && [ -n "$v2" ] && [ "$v2" -gt "$v1" ] 2>/dev/null; then
-    ok "run:shared-state" "the count carries across replicas ($v1 then $v2)"
-  else
-    bad "run:shared-state" "the count did not advance across requests — each copy is keeping its own"
+    bad "run:replicas" "/whoami returned nothing — is the proxy forwarding to the replicas?"
   fi
 
   # ---- and whether anything was remembered ---------------------------------
@@ -800,6 +849,7 @@ PYEOF
 # ── run ──────────────────────────────────────────────────────────────────────
 if [ "$LIB" = 0 ]; then
   case "$SECTION" in
+    config)     section_config ;;
     stack)      section_stack ;;
     drift)      section_drift ;;
     cloud-plan) section_cloud_plan ;;
