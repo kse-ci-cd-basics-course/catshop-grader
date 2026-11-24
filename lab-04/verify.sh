@@ -7,7 +7,8 @@
 #
 #   config   the configuration judged from the files alone     required
 #   stack    the place really comes up, and really goes away   required
-#   drift    state against reality, and what plan notices      bonus
+#   drift    state against reality, and what plan notices      required
+#   pool     more than one copy, and something in front        bonus
 #
 # `config` touches nothing: no server, no certificate, no state backend, which
 # is what lets the course's own CI run it on every push against a known-good and
@@ -41,8 +42,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$SECTION" in
-  config|stack|drift) : ;;
-  "") echo "--section is required: config | stack | drift" >&2; exit 2 ;;
+  config|stack|drift|pool) : ;;
+  "") echo "--section is required: config | stack | drift | pool" >&2; exit 2 ;;
   *)  echo "unknown section '$SECTION'" >&2; exit 2 ;;
 esac
 
@@ -344,12 +345,12 @@ stack_text_checks() {
     && ok "hcl:volume" "a docker_volume is declared" \
     || bad "hcl:volume" "no docker_volume — a volume is part of the place, and destroy has to take it away again"
 
-  tf_true "any(re.search(r'(?m)^\\s*count\\s*=', b['body']) for b in resources(r'^docker_container$'))" \
-    && ok "hcl:count" "the replicas come from one resource with count" \
-    || bad "hcl:count" "two copy-pasted container blocks are not two replicas — use count on one resource"
+  tf_true "len(resources(r'^docker_container$')) >= 1" \
+    && ok "hcl:container" "a docker_container is declared" \
+    || bad "hcl:container" "no docker_container — there is nothing for the place to run"
 
   tf_true "re.search(r'templatefile\\s*\\(', d['text']) is not None" \
-    && ok "hcl:templatefile" "the proxy configuration is rendered, not pasted" \
+    && ok "hcl:templatefile" "the server configuration is rendered, not pasted" \
     || bad "hcl:templatefile" "nginx.conf.tftpl must be rendered with templatefile(...)"
 
   # This lab builds nothing. An image built here would put a Dockerfile, a
@@ -376,13 +377,13 @@ stack_text_checks() {
   # `count`, which is the single most common way to get this lab wrong.
   if [ -f "$TFDIR/nginx.conf.tftpl" ]; then
     if grep -qE '\$\{|%\{' "$TFDIR/nginx.conf.tftpl"; then
-      ok "tpl:interpolated" "the upstream list is generated from the resource"
+      ok "tpl:interpolated" "the file is rendered from variables, not typed"
     else
-      bad "tpl:interpolated" "nginx.conf.tftpl has no interpolation — raise count to three and nothing changes"
+      bad "tpl:interpolated" "nginx.conf.tftpl has no interpolation — then it is a static file with a .tftpl name, and templatefile() is doing nothing"
     fi
-    grep -qiE 'upstream\s|proxy_pass' "$TFDIR/nginx.conf.tftpl" \
-      && ok "tpl:upstream" "an upstream pool and a proxy_pass rule are present" \
-      || bad "tpl:upstream" "no upstream / proxy_pass — this file is the proxy"
+    grep -qiE 'listen|location' "$TFDIR/nginx.conf.tftpl" \
+      && ok "tpl:server" "the rendered file is a server configuration" \
+      || bad "tpl:server" "nginx.conf.tftpl does not configure a server"
   fi
   return 0
 }
@@ -404,7 +405,7 @@ section_config() {
 }
 
 section_stack() {
-  sect "section stack — a proxy, two replicas, a volume"
+  sect "section stack — the place really comes up"
 
   stack_text_checks || return
 
@@ -412,7 +413,7 @@ section_stack() {
   apply_stack || return
 
   if wait_for "$URL/health" 90; then
-    ok "run:health" "the stack answers /health through the proxy"
+    ok "run:health" "the place answers /health at its own URL"
   else
     bad "run:health" "nothing answered $URL/health within 90s"
     return
@@ -425,39 +426,8 @@ section_stack() {
     if printf '%s' "$URL" | grep -qi "/${GITHUB_REPOSITORY_OWNER}/\?\$"; then
       ok "run:own-url" "the URL belongs to $GITHUB_REPOSITORY_OWNER"
     else
-      bad "run:own-url" "$URL is not this repository owner's address — a stack is graded at its own URL or not at all"
+      bad "run:own-url" "$URL is not this repository owner's address — a place is graded at its own URL or not at all"
     fi
-  fi
-
-  # Separate connections, because keep-alive pins the client to whichever
-  # backend answered first and a correct two-replica stack then looks like one.
-  #
-  # This RETRIES for up to 45s, and that is not padding. A proxy with max_fails
-  # set will exclude a backend that failed once — including one that was merely
-  # slow to start — and let it back in after fail_timeout. Measured on a clean
-  # apply: all requests hit a single replica for the first ~30s, then settled to
-  # an even split. A fixed loop straight after /health answers fails a correct
-  # configuration.
-  local seen i who distinct=0 waited=0
-  while [ "$waited" -lt 45 ]; do
-    seen=""
-    for i in $(seq 1 12); do
-      # nginx answers /whoami with its own $hostname, one bare line. No JSON,
-      # because this lab has no application in it.
-      who=$(hit "$URL/whoami" | tr -d '\r' | head -1)
-      [ -n "$who" ] && seen="$seen$who"$'\n'
-    done
-    distinct=$(printf '%s' "$seen" | sort -u | grep -c . || true)
-    [ "${distinct:-0}" -ge 2 ] && break
-    sleep 5
-    waited=$((waited+5))
-  done
-  if [ "${distinct:-0}" -ge 2 ]; then
-    ok "run:replicas" "$distinct distinct replicas answered (settled after ${waited}s)"
-  elif [ "${distinct:-0}" = 1 ]; then
-    bad "run:replicas" "every request reached the same copy — one replica, or the pool has one entry"
-  else
-    bad "run:replicas" "/whoami returned nothing — is the proxy forwarding to the replicas?"
   fi
 
   # ---- and whether anything was remembered ---------------------------------
@@ -525,23 +495,23 @@ section_drift() {
   name=$(terraform -chdir="$TFDIR" state show "$addr" 2>/dev/null \
          | sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' | head -1)
   if [ -z "$name" ] || ! docker stop "$name" >/dev/null 2>&1; then
-    bad "drift:target" "could not stop a replica ($addr)"
+    bad "drift:target" "could not stop the container ($addr)"
     return
   fi
   ok "drift:target" "stopped $name by hand — Terraform was not told"
 
-  # nginx retries the next upstream on a refused connection, so the client never
-  # sees the dead one. That is the behaviour, not a detail of the grader.
-  local i good=0
-  for i in $(seq 1 20); do
-    [ "$(code_of "$URL/health")" = "200" ] && good=$((good+1))
+  # With one container the place goes down, and that is the point: the machine
+  # changed and the state did not. A student who keeps serving here has either
+  # more than one container (which is the bonus, not this section) or something
+  # other than Terraform putting it back.
+  local i down=0
+  for i in $(seq 1 10); do
+    [ "$(code_of "$URL/health")" = "200" ] || down=$((down+1))
   done
-  if [ "$good" = 20 ]; then
-    ok "drift:still-serving" "20 of 20 requests answered with one replica down"
-  elif [ "$good" -ge 17 ]; then
-    warn "drift:still-serving" "$good of 20 answered — the misses are the window before the proxy excluded the dead backend; say so in the pull request"
+  if [ "$down" -ge 8 ]; then
+    ok "drift:reality-changed" "the URL stopped answering — the world moved and the state did not"
   else
-    bad "drift:still-serving" "$good of 20 answered — a stopped container does not refuse connections, it stops answering. Without proxy_connect_timeout the failover you configured never runs in time"
+    warn "drift:reality-changed" "the URL still answers with that container stopped; if you built the replica bonus, say so in the pull request"
   fi
 
   # -detailed-exitcode: 0 no changes, 1 error, 2 changes. The wrapper that
@@ -576,6 +546,18 @@ print(n)')
     bad "drift:one-resource" "$changes resources would change — one container stopped should be one resource"
   fi
 
+  # Repair, and prove it. A plan that notices is half the lesson; an apply that
+  # puts it back is the other half, and it is the half a student skips.
+  if tf "$TFDIR" apply -auto-approve -input=false -no-color; then
+    if wait_for "$URL/health" 90; then
+      ok "drift:repaired" "apply put it back and the URL answers again"
+    else
+      bad "drift:repaired" "apply ran but the URL never came back"
+    fi
+  else
+    bad "drift:repaired" "terraform apply failed to repair the drift — $(tf_tail)"
+  fi
+
   # The write-up carries the part no script can see: what they understood.
   local body
   body=$(tr '[:upper:]' '[:lower:]' < DRIFT.md 2>/dev/null)
@@ -591,12 +573,91 @@ print(n)')
 }
 
 
+# ── section: pool (bonus) ────────────────────────────────────────────────────
+#
+# The part of the lab that is worth marks but cannot cost them: do early what
+# the next lab needs. One resource with `count`, a proxy in front, and a
+# template whose upstream list comes from the resource rather than from typing.
+section_pool() {
+  sect "section pool — more than one of it, and something in front"
+
+  if ! read_tf "$TFDIR"; then
+    bad "tf:read" "no .tf files under $TFDIR/"
+    return
+  fi
+
+  tf_true "any(re.search(r'(?m)^\\s*count\\s*=', b['body']) for b in resources(r'^docker_container$'))" \
+    && ok "pool:count" "the copies come from one resource with count" \
+    || bad "pool:count" "two hand-written container blocks are two resources that happen to look alike"
+
+  if [ -f "$TFDIR/nginx.conf.tftpl" ]; then
+    grep -qiE 'upstream\s|proxy_pass' "$TFDIR/nginx.conf.tftpl" \
+      && ok "pool:upstream" "an upstream pool and a proxy_pass rule are present" \
+      || bad "pool:upstream" "no upstream / proxy_pass — nothing is balancing anything"
+    # A list the template walks is the difference between a pool that follows
+    # `count` and three lines that happen to be right today.
+    grep -qE '%\{[[:space:]]*for' "$TFDIR/nginx.conf.tftpl" \
+      && ok "pool:generated" "the upstream list is generated from the resource" \
+      || bad "pool:generated" "the pool does not loop — raise count and this file does not change"
+  fi
+
+  apply_stack || return
+  wait_for "$URL/health" 90 || { bad "pool:health" "nothing answered $URL/health"; return; }
+  ok "pool:health" "the pool answers through whatever is in front of it"
+
+  # Separate connections, because keep-alive pins the client to whichever
+  # backend answered first and a correct pool then looks like one copy. This
+  # retries: a proxy with max_fails excludes a backend that was merely slow to
+  # start, and lets it back in after fail_timeout.
+  local seen i who distinct=0 waited=0
+  while [ "$waited" -lt 45 ]; do
+    seen=""
+    for i in $(seq 1 12); do
+      who=$(hit "$URL/whoami" | tr -d '\r' | head -1)
+      [ -n "$who" ] && seen="$seen$who"$'\n'
+    done
+    distinct=$(printf '%s' "$seen" | sort -u | grep -c . || true)
+    [ "${distinct:-0}" -ge 2 ] && break
+    sleep 5
+    waited=$((waited+5))
+  done
+  if [ "${distinct:-0}" -ge 2 ]; then
+    ok "pool:replicas" "$distinct distinct copies answered (settled after ${waited}s)"
+  elif [ "${distinct:-0}" = 1 ]; then
+    bad "pool:replicas" "every request reached the same copy — one replica, or the pool has one entry"
+  else
+    bad "pool:replicas" "/whoami returned nothing — is the proxy forwarding to the copies?"
+  fi
+
+  # With a pool, stopping one copy must NOT take the place down. That is the
+  # half of a load balancer nobody writes down: proxy_next_upstream, and a
+  # connect timeout short enough for the retry to happen inside the request.
+  local addr name good=0
+  addr=$(terraform -chdir="$TFDIR" state list 2>/dev/null | grep '^docker_container\.' | grep '\[0\]' | head -1)
+  name=$(terraform -chdir="$TFDIR" state show "$addr" 2>/dev/null \
+         | sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' | head -1)
+  if [ -n "$name" ] && docker stop "$name" >/dev/null 2>&1; then
+    for i in $(seq 1 20); do
+      [ "$(code_of "$URL/health")" = "200" ] && good=$((good+1))
+    done
+    if [ "$good" -ge 18 ]; then
+      ok "pool:survives" "$good of 20 requests answered with one copy stopped"
+    else
+      bad "pool:survives" "$good of 20 answered — a stopped container refuses connections, and without proxy_next_upstream plus a short proxy_connect_timeout the retry never happens inside the request"
+    fi
+    tf "$TFDIR" apply -auto-approve -input=false -no-color >/dev/null 2>&1 || true
+  else
+    warn "pool:survives" "could not stop a copy to test failover"
+  fi
+}
+
 # ── run ──────────────────────────────────────────────────────────────────────
 if [ "$LIB" = 0 ]; then
   case "$SECTION" in
     config)     section_config ;;
     stack)      section_stack ;;
     drift)      section_drift ;;
+    pool)       section_pool ;;
   esac
   emit_report "$SECTION"
   [ "${BONUS:-0}" = 1 ] && exit 0

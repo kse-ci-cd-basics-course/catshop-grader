@@ -56,6 +56,13 @@ on:
         required: false
         type: boolean
         default: true
+      min_replicas:
+        description: >-
+          How many distinct copies must answer /whoami. The lab requires one;
+          set it to 2 if you built the pool bonus and want it checked.
+        required: false
+        type: number
+        default: 1
       write_backend:
         description: >-
           Generate the `cloud {}` block instead of expecting one in the
@@ -244,11 +251,15 @@ jobs:
           fi
           echo "health: $(cat /tmp/health)"
 
-          # Several calls must not all land on one replica. This is what proves
-          # `count` built a pool rather than one container twice.
-          seen=$(for _ in $(seq 1 8); do curl -sS "$url/whoami"; echo; done | sort -u | wc -l)
-          echo "distinct replicas answering: $seen"
-          [ "$seen" -ge 2 ] || { echo "::error::every request hit the same replica"; exit 1; }
+          # How many distinct copies answered. One is the lab's requirement; two
+          # or more is the pool bonus, and asserting it by default would fail a
+          # correct required solution.
+          seen=$(for _ in $(seq 1 8); do curl -sS "$url/whoami"; echo; done | sort -u | grep -c . || true)
+          echo "distinct copies answering: $seen (need ${{ inputs.min_replicas }})"
+          if [ "${seen:-0}" -lt "${{ inputs.min_replicas }}" ]; then
+            echo "::error::only $seen distinct copies answered"
+            exit 1
+          fi
 
       - name: applying twice changes nothing
         if: steps.mode.outputs.mode == 'apply'
@@ -265,7 +276,11 @@ jobs:
         if: inputs.drift_check && steps.mode.outputs.mode == 'apply'
         run: |
           set -euo pipefail
-          victim=$(docker ps --format '{{.Names}}' | grep -- '-app-0$' | head -1)
+          # Whatever they called it. Grepping for a name this workflow invented
+          # would only ever work for the course's own fixture.
+          victim=$(docker ps --format '{{.Names}}' | head -1)
+          [ -n "$victim" ] || { echo "::error::nothing is running to break"; exit 1; }
+          echo "stopping $victim behind Terraform's back"
           docker stop "$victim" >/dev/null
           set +e
           terraform plan -no-color -detailed-exitcode
