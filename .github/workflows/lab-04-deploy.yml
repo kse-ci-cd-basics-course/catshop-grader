@@ -12,8 +12,8 @@
 #       secrets:
 #         TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
 #
-# That is the whole student-facing surface. Everything that is the same for all
-# 42 of them lives here: proving who they are to the server, queueing for a
+# That is the whole student-facing surface. Everything that is the same for
+# everyone lives here: proving who they are to the server, queueing for a
 # deployment slot, pointing Docker at their own space, binding to loopback,
 # knowing their public URL, plan on a pull request and apply on main.
 #

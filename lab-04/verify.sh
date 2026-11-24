@@ -58,7 +58,7 @@ export JSON KEEP
 
 TFDIR=terraform
 
-# The lab fixes three names so one grader can read forty-two configurations:
+# The lab fixes three names so one grader can read every configuration:
 # two input variables and one output. Everything else is the student's.
 VAR_HOST=docker_host
 VAR_PORT=port
@@ -371,7 +371,7 @@ stack_text_checks() {
 
   tf_true "re.search(r'(?m)^\\s*output\\s+\"url\"', d['text']) is not None" \
     && ok "hcl:output-url" "the stack's address comes out of terraform" \
-    || bad "hcl:output-url" "no output \"url\" — one grader reads thirty-two configurations and that name is fixed"
+    || bad "hcl:output-url" "no output \"url\" — one grader reads every configuration and that name is fixed"
 
   # A template that names the backends by hand looks right and silently ignores
   # `count`, which is the single most common way to get this lab wrong.
