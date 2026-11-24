@@ -2,22 +2,22 @@
 #
 # verify.sh — grade ONE section of lab 4. Everything is in this file.
 #
-#   ./verify.sh --section stack --path lab-04
-#   ./verify.sh --section cloud-plan --path lab-04 --json
+#   ./verify.sh --section config --path lab-04
+#   ./verify.sh --section stack  --path lab-04 --json
 #
-#   stack        the declared stack really comes up, and really goes away   required
-#   drift        state against reality, and what plan notices               required
-#   cloud-plan   the same shape for a cloud, validated with no account      required
-#   deployed     a real URL, running the commit being graded                bonus
+#   config   the configuration judged from the files alone     required
+#   stack    the place really comes up, and really goes away   required
+#   drift    state against reality, and what plan notices      bonus
 #
-# Two of these sections really run `terraform apply` on this runner. There is no
-# cloud account anywhere and no secret: the provider is `kreuzwerker/docker` and
-# the endpoint is the runner's own daemon. `cloud-plan` never leaves `validate`,
-# which is offline, so it needs no credentials either.
+# `config` touches nothing: no server, no certificate, no state backend, which
+# is what lets the course's own CI run it on every push against a known-good and
+# a known-broken configuration.
 #
-# `deployed` is the only check that leaves the machine. It probes a URL the
-# student published, over the public internet, and the check that makes it mean
-# anything is that /version must return the commit being graded.
+# `stack` and `drift` really apply. On the course server the endpoint arrives as
+# TF_VAR_docker_host — an ssh:// URL for a certificate this run was issued for an
+# hour — and the state lives in the student's own HCP organization. Neither
+# section may override those: doing so deploys onto the runner instead of onto
+# the server the student is graded against.
 #
 # Flags: --path DIR · --port N · --json · --keep · --bonus
 # Exit 0 = nothing failed. A WARN is a judgement call for the pull request.
@@ -41,8 +41,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$SECTION" in
-  config|stack|drift|cloud-plan|deployed) : ;;
-  "") echo "--section is required: config | stack | drift | cloud-plan | deployed" >&2; exit 2 ;;
+  config|stack|drift) : ;;
+  "") echo "--section is required: config | stack | drift" >&2; exit 2 ;;
   *)  echo "unknown section '$SECTION'" >&2; exit 2 ;;
 esac
 
@@ -56,8 +56,6 @@ export JSON KEEP
 . "$HERE/../common/lib.sh"
 
 TFDIR=terraform
-CLOUDDIR=cloud
-DEPLOYDIR=deploy
 
 # The lab fixes three names so one grader can read forty-two configurations:
 # two input variables and one output. Everything else is the student's.
@@ -74,7 +72,7 @@ tf_cleanup() {
   fi
   [ "$APPLIED" = 1 ] && terraform -chdir="$TFDIR" destroy -auto-approve -input=false \
     >/dev/null 2>&1 || true
-  rm -f "$TFDIR/tfplan" "$CLOUDDIR/tfplan" 2>/dev/null || true
+  rm -f "$TFDIR/tfplan" 2>/dev/null || true
 }
 [ "$LIB" = 0 ] && trap tf_cleanup EXIT
 
@@ -271,21 +269,6 @@ PYEOF
 }
 
 
-# ── which of the two paths was taken ─────────────────────────────────────────
-#
-# The lab accepts either proof, and they are not the same work:
-#
-#   local   the stack really applies here, and the state is kept somewhere that
-#           outlives the runner
-#   remote  it is deployed on their own account and answers on a public URL
-#
-# A published URL is the signal, because it is the thing only the remote path
-# can produce. Nothing asks the student to declare which one they chose.
-chosen_path() {
-  [ -s "$DEPLOYDIR/url.txt" ] && { echo remote; return; }
-  echo local
-}
-
 # The state has to outlive the job on the local path, or "No changes." is a
 # sentence that can never be true and half the lesson is missing.
 check_remote_state() {
@@ -421,11 +404,6 @@ section_config() {
 }
 
 section_stack() {
-  if [ "$(chosen_path)" = remote ]; then
-    sect "section stack — deployed, on your own account"
-    section_deployed_core
-    return
-  fi
   sect "section stack — a proxy, two replicas, a volume"
 
   stack_text_checks || return
@@ -498,16 +476,6 @@ section_stack() {
     fi
   else
     bad "tf:destroy" "terraform destroy failed — $(tf_tail)"
-  fi
-}
-
-# The remote path, as graded by `stack`. Identical checks to the bonus, so the
-# two paths are marked on the same scale rather than on sympathy.
-section_deployed_core() {
-  section_deployed
-  if [ -d "$CLOUDDIR" ] || [ -d "$DEPLOYDIR" ]; then
-    read_tf "$DEPLOYDIR" || read_tf "$CLOUDDIR" || true
-    cloud_checks
   fi
 }
 
@@ -623,237 +591,12 @@ print(n)')
 }
 
 
-# ── the cloud assertions, shared by cloud-plan and the remote path ───────────
-#
-# Which cloud is detected from the resource types, never asked for. The shared
-# checks are the architecture; after them each cloud gets the two or three
-# traps that are only traps on that cloud.
-cloud_checks() {
-  local cloud
-  cloud=$(tfq "'google' if resources(r'^google_') else ('aws' if resources(r'^aws_') else ('azure' if resources(r'^azurerm_') else 'other'))")
-  ok "cloud:provider" "reading this as ${cloud}"
-
-  tf_true "len(resources(r'(load_?balancer|_lb$|_alb|forwarding_rule|target_pool|loadbalancer)')) >= 1" \
-    && ok "cloud:load-balancer" "a load balancer is declared" \
-    || bad "cloud:load-balancer" "no load balancer resource — that is the way in"
-
-  tf_true "len([b for b in resources(r'(instance|server|droplet|virtual_machine|_vm$)') if not re.search(r'(sql|database|rds|rdb|postgres|mysql)', b['labels'][0])]) >= 1" \
-    && ok "cloud:compute" "compute is declared" \
-    || bad "cloud:compute" "no instance, server or droplet — nothing is running the image"
-
-  tf_true "two_of_them()" \
-    && ok "cloud:two" "there are two of them" \
-    || bad "cloud:two" "one instance is not redundancy — declare two, by count or by group size"
-
-  tf_true "len(resources(r'(sql_database_instance|db_instance|rds|database_cluster|rdb_instance|postgresql|mysql_)')) >= 1" \
-    && ok "cloud:database" "a managed database is declared" \
-    || bad "cloud:database" "no managed database"
-
-  tf_true "re.search(r'/health', d['text']) is not None and re.search(r'health', d['text'], re.I) is not None" \
-    && ok "cloud:health-check" "a health check is declared against /health" \
-    || bad "cloud:health-check" "declare the health check, and point it at /health"
-
-  case "$cloud" in
-    google)
-      # Health checks arrive from two fixed Google ranges, never from the load
-      # balancer. Miss them and every backend is unhealthy with nothing in any log.
-      tf_true "'35.191.0.0/16' in d['text'] and '130.211.0.0/22' in d['text']" \
-        && ok "gcp:health-ranges" "the firewall allows 35.191.0.0/16 and 130.211.0.0/22" \
-        || bad "gcp:health-ranges" "nothing allows Google's health-check ranges — every backend will be unhealthy and no log will say why"
-
-      tf_true "len(resources(r'^google_compute_firewall$')) >= 1" \
-        && ok "gcp:firewall" "firewall rules are declared" \
-        || bad "gcp:firewall" "no google_compute_firewall — the network denies ingress by default"
-
-      # A private Cloud SQL address needs a peering, and it is the resource
-      # nobody draws.
-      if tf_true "len(resources(r'^google_sql_database_instance$')) >= 1"; then
-        tf_true "len(resources(r'^google_service_networking_connection$')) >= 1 or 'ipv4_enabled' in d['text']" \
-          && ok "gcp:db-reachable" "the database's addressing is declared" \
-          || warn "gcp:db-reachable" "a private Cloud SQL address needs google_service_networking_connection — say how yours is reached"
-      fi
-
-      tf_true "len(resources(r'^google_compute_router_nat$')) == 0" \
-        && ok "gcp:no-nat" "no Cloud NAT" \
-        || warn "gcp:no-nat" "Cloud NAT is ~\$33 a month — justify it in COST.md, or give the instances public addresses"
-      ;;
-    aws)
-      # An ALB will not create at all with one subnet, and the error arrives at
-      # apply rather than at plan.
-      tf_true "len(resources(r'^aws_subnet$')) >= 2 or any('subnets' in b['body'] for b in resources(r'^aws_lb$'))" \
-        && ok "aws:two-subnets" "more than one subnet — an ALB needs at least two, in different zones" \
-        || bad "aws:two-subnets" "an ALB requires subnets in two availability zones and will not create with one"
-
-      tf_true "len(resources(r'^aws_lb_target_group$')) >= 1" \
-        && ok "aws:target-group" "a target group is declared" \
-        || bad "aws:target-group" "no aws_lb_target_group — that is the pool"
-
-      tf_true "len(resources(r'^aws_lb_listener$')) >= 1" \
-        && ok "aws:listener" "a listener is declared" \
-        || bad "aws:listener" "no aws_lb_listener — nothing is listening on the load balancer"
-
-      tf_true "len(resources(r'^aws_security_group$')) >= 1" \
-        && ok "aws:security-group" "security groups are declared" \
-        || bad "aws:security-group" "no security group — the instances accept nothing, including the load balancer"
-
-      tf_true "len(resources(r'nat_gateway')) == 0" \
-        && ok "aws:no-nat" "no NAT gateway" \
-        || bad "aws:no-nat" "a NAT gateway is ~\$32 a month PER ZONE that nobody in this exercise chose"
-      ;;
-  esac
-
-  local ndata
-  ndata=$(tfq "len(blocks('data'))")
-  if [ "${ndata:-0}" != "0" ]; then
-    warn "cloud:data-sources" "$ndata data source(s) — say how each resolves without an API call"
-  else
-    ok "cloud:data-sources" "nothing has to be looked up to read this file"
-  fi
-}
-
-# ── section: cloud-plan ──────────────────────────────────────────────────────
-#
-# Same architecture, written for a cloud, graded without an account. `validate`
-# is offline; `plan` is not, which is why this section stops at validate and the
-# real apply lives in the bonus.
-section_cloud_plan() {
-  sect "section cloud-plan — the same three things, rented"
-
-  # Any .tf file will do: splitting network, compute and the load balancer into
-  # separate files is better practice than one main.tf, and the first version of
-  # this check failed a configuration for being well organised.
-  if compgen -G "$CLOUDDIR/*.tf" >/dev/null 2>&1; then
-    ok "file:$CLOUDDIR/*.tf" "$(ls "$CLOUDDIR"/*.tf | wc -l | tr -d ' ') file(s)"
-  else
-    bad "file:$CLOUDDIR/*.tf" "no .tf files under $CLOUDDIR/"
-  fi
-  need_file "$CLOUDDIR/variables.tf"
-  need_file COST.md
-
-  if ! read_tf "$CLOUDDIR"; then
-    bad "tf:read" "no .tf files under $CLOUDDIR/ — there is nothing to grade"
-    return
-  fi
-
-  if tf "$CLOUDDIR" init -backend=false -input=false -no-color; then
-    ok "cloud:init" "the provider resolves with no backend and no account"
-  else
-    bad "cloud:init" "terraform init -backend=false failed — $(tf_tail)"
-    return
-  fi
-
-  if tf "$CLOUDDIR" validate -no-color; then
-    ok "cloud:validate" "valid with no credentials present anywhere"
-  else
-    bad "cloud:validate" "terraform validate failed — $(tf_tail)"
-  fi
-
-  cloud_checks
-
-  # COST.md is a third of the point: a declared architecture you cannot price is
-  # an architecture you have not understood.
-  if grep -qE '\$[0-9]' COST.md 2>/dev/null && grep -qiE 'month' COST.md 2>/dev/null; then
-    ok "doc:cost" "COST.md prices the file per month"
-  else
-    bad "doc:cost" "COST.md needs real figures — a dollar amount per resource, per month"
-  fi
-  if [ "$(grep -cE '^\s*[-|*]|^\s*\|' COST.md 2>/dev/null || echo 0)" -ge 4 ]; then
-    ok "doc:cost-itemised" "the cost is broken down, not a single number"
-  else
-    bad "doc:cost-itemised" "itemise it — one line per resource, then the total at rest"
-  fi
-}
-
-# ── section: deployed · bonus ────────────────────────────────────────────────
-#
-# Provider-agnostic by construction. Nothing here asks which cloud it is or
-# calls anybody's API: it probes a URL the student published. The check that
-# makes the whole thing mean something is /version — the running code must be
-# the commit being graded, which no screenshot and no stale deployment can fake.
-section_deployed() {
-  sect "section deployed (bonus) — a real URL, running this commit"
-
-  if [ ! -f "$DEPLOYDIR/url.txt" ]; then
-    bad "deployed:url" "no $DEPLOYDIR/url.txt — one line, the https URL, nothing else"
-    return
-  fi
-  local url
-  url=$(head -1 "$DEPLOYDIR/url.txt" | tr -d ' \t\r"' )
-  url="${url%/}"
-  case "$url" in
-    https://*) ok "deployed:url" "$url" ;;
-    http://*)  bad "deployed:url" "http:// — the certificate is part of the exercise"; return ;;
-    *)         bad "deployed:url" "'$url' is not a URL"; return ;;
-  esac
-
-  # No -k anywhere. A self-signed certificate is a failed check, not a warning.
-  if curl -sS --fail --proto '=https' -m 25 -o /dev/null "$url/health" 2>/dev/null; then
-    ok "deployed:tls" "the certificate verifies and /health answers 200"
-  else
-    if curl -sS --fail --proto '=https' --insecure -m 25 -o /dev/null "$url/health" 2>/dev/null; then
-      bad "deployed:tls" "it answers, but the certificate does not verify"
-    else
-      bad "deployed:tls" "$url/health did not answer 200 over verified https"
-    fi
-    return
-  fi
-
-  local sha want
-  sha=$(json_field "$(curl -sS --fail -m 25 "$url/version" 2>/dev/null)" sha)
-  want="${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null)}"
-  if [ -z "$sha" ] || [ "$sha" = "unknown" ]; then
-    bad "deployed:version" "/version says '${sha:-nothing}' — build the sha in with --build-arg GIT_SHA"
-  elif [ -n "$want" ] && [ "${sha:0:7}" = "${want:0:7}" ]; then
-    ok "deployed:version" "it is running ${sha:0:7}, the commit being graded"
-  else
-    bad "deployed:version" "it is running ${sha:0:7}, the graded commit is ${want:0:7} — deploy this one"
-  fi
-
-  if [ -f "$DEPLOYDIR/outputs.json" ]; then
-    local out_url
-    out_url=$(python3 - "$DEPLOYDIR/outputs.json" <<'PYEOF' 2>/dev/null
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    print(""); raise SystemExit
-for v in d.values() if isinstance(d, dict) else []:
-    s = v.get("value") if isinstance(v, dict) else v
-    if isinstance(s, str) and s.startswith("http"):
-        print(s.rstrip("/")); break
-PYEOF
-)
-    if [ -z "$out_url" ]; then
-      bad "deployed:terraform" "no http value in outputs.json — the address must come out of terraform output"
-    elif [ "$out_url" = "$url" ]; then
-      ok "deployed:terraform" "terraform output and url.txt agree"
-    else
-      bad "deployed:terraform" "terraform output says $out_url, url.txt says $url"
-    fi
-  else
-    bad "deployed:terraform" "no $DEPLOYDIR/outputs.json — commit \`terraform output -json\`"
-  fi
-
-  # Every provider names this header differently, so a miss is something to
-  # explain rather than something to lose. The lesson is that it is there at all.
-  local who ff
-  who=$(curl -sS --fail -m 25 "$url/whoami" 2>/dev/null)
-  ff=$(json_field "$who" forwarded_for)
-  if [ -n "$ff" ]; then
-    ok "deployed:proxy" "something is in front of you — X-Forwarded-For is set"
-  else
-    warn "deployed:proxy" "no X-Forwarded-For — say in the pull request which header your provider uses instead"
-  fi
-}
-
 # ── run ──────────────────────────────────────────────────────────────────────
 if [ "$LIB" = 0 ]; then
   case "$SECTION" in
     config)     section_config ;;
     stack)      section_stack ;;
     drift)      section_drift ;;
-    cloud-plan) section_cloud_plan ;;
-    deployed)   section_deployed ;;
   esac
   emit_report "$SECTION"
   [ "${BONUS:-0}" = 1 ] && exit 0

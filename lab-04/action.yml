@@ -1,13 +1,13 @@
 name: "Catshop lab 4 · verify"
-description: "Grade one section of lab 4 (the declared stack, drift, the cloud plan, and an optional real deployment) and report it as a named check."
+description: "Grade one section of lab 4 (the configuration, the declared place, and the drift bonus) and report it as a named check."
 author: "KSE · CI/CD and Cloud Deployment"
 
 inputs:
   section:
     description: >-
-      Which section to grade: config | stack | drift | cloud-plan | deployed.
-      `stack` accepts EITHER path: the stack applied here with the state kept
-      off the runner, or a real deployment answering on a published URL.
+      Which section to grade: config | stack | drift.
+      `config` judges the files alone and needs nothing. `stack` applies to the
+      course server through this run's certificate. `drift` is the bonus.
     required: true
   path:
     description: >-
