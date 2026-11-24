@@ -1,0 +1,302 @@
+# Reusable workflow — deploy a lab-04 stack to the course VPS.
+#
+#   permissions:
+#     contents: read
+#     id-token: write            # REQUIRED: no token, no certificate
+#
+#   jobs:
+#     deploy:
+#       uses: kse-ci-cd-basics-course/catshop-grader/.github/workflows/lab-04-deploy.yml@v1
+#       with:
+#         hcp_org: ${{ vars.TF_CLOUD_ORGANIZATION }}
+#       secrets:
+#         TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+#
+# That is the whole student-facing surface. Everything that is the same for all
+# 42 of them lives here: proving who they are to the server, queueing for a
+# deployment slot, pointing Docker at their own space, binding to loopback,
+# knowing their public URL, plan on a pull request and apply on main.
+#
+# What stays in the student's repository, because it is the lab: the Terraform
+# itself, and the `cloud {}` block that says their state is not on the runner.
+name: lab-04-deploy
+
+on:
+  workflow_call:
+    inputs:
+      signer:
+        description: "Base URL of the course signer"
+        required: false
+        type: string
+        default: "https://grizik.tech"
+      path:
+        description: "The lab folder; the Terraform is expected in <path>/terraform"
+        required: false
+        type: string
+        default: "lab-04"
+      mode:
+        description: >-
+          plan, apply, or auto. auto plans on a pull request and applies on a
+          push to the default branch, which is the shape the lecture teaches.
+        required: false
+        type: string
+        default: "auto"
+      hcp_org:
+        description: "Your HCP Terraform organization"
+        required: false
+        type: string
+        default: ""
+      hcp_workspace:
+        description: "Your HCP Terraform workspace"
+        required: false
+        type: string
+        default: "lab-04"
+      probe:
+        description: "After an apply, check the public URL actually answers"
+        required: false
+        type: boolean
+        default: true
+      write_backend:
+        description: >-
+          Generate the `cloud {}` block instead of expecting one in the
+          repository. The course harness uses this; students declare their own,
+          because configuring remote state is part of the lab.
+        required: false
+        type: boolean
+        default: false
+      ensure_workspace:
+        description: >-
+          Create the HCP workspace in Local execution mode if it is missing.
+          Students do this once in the UI, which is where the execution-mode
+          setting is worth meeting.
+        required: false
+        type: boolean
+        default: false
+      drift_check:
+        description: "Break a replica behind Terraform's back and prove the plan notices"
+        required: false
+        type: boolean
+        default: false
+      destroy:
+        description: "Tear the stack down at the end of the run"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      TF_API_TOKEN:
+        description: "Your HCP Terraform user token"
+        required: false
+    outputs:
+      url:
+        description: "Where the stack answers from the outside"
+        value: ${{ jobs.deploy.outputs.url }}
+      user:
+        description: "The unix space this run deployed into"
+        value: ${{ jobs.deploy.outputs.user }}
+      port:
+        description: "The loopback port the stack publishes on"
+        value: ${{ jobs.deploy.outputs.port }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30      # the slot queue alone can be 15
+    outputs:
+      url: ${{ steps.probe.outputs.url || steps.cert.outputs.url }}
+      user: ${{ steps.cert.outputs.user }}
+      port: ${{ steps.cert.outputs.port }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.path }}/terraform
+
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+      # An empty `cloud {}` block takes its organization and workspace from the
+      # environment. That is what lets one configuration serve every student
+      # without anyone editing a name into a file.
+      TF_CLOUD_ORGANIZATION: ${{ inputs.hcp_org }}
+      TF_WORKSPACE: ${{ inputs.hcp_workspace }}
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      # ── decide plan or apply before anything expensive happens ───────────
+      - id: mode
+        name: plan or apply
+        working-directory: .
+        run: |
+          set -euo pipefail
+          want="${{ inputs.mode }}"
+          if [ "$want" = auto ]; then
+            if [ "${{ github.event_name }}" = pull_request ]; then
+              want=plan
+            elif [ "${{ github.ref_name }}" = "${{ github.event.repository.default_branch }}" ]; then
+              want=apply
+            else
+              want=plan
+            fi
+          fi
+          echo "mode=$want" >> "$GITHUB_OUTPUT"
+          echo "this run will **$want**" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── the only credential in the whole lab ─────────────────────────────
+      # No key, no password, no secret for the server. The run's own OIDC token
+      # is traded for a certificate that is valid for an hour, can only run one
+      # command, and can only reach this student's own engine.
+      - id: cert
+        name: prove who this run is, and get a one-hour certificate
+        uses: kse-ci-cd-basics-course/catshop-grader/catshop-cert@main
+        with:
+          signer: ${{ inputs.signer }}
+
+      # ── state ────────────────────────────────────────────────────────────
+      - name: create the HCP workspace if it is missing
+        if: inputs.ensure_workspace && inputs.hcp_org != ''
+        working-directory: .
+        env:
+          ORG: ${{ inputs.hcp_org }}
+          WS: ${{ inputs.hcp_workspace }}
+          TOK: ${{ secrets.TF_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          api=https://app.terraform.io/api/v2
+          hdr=(-H "Authorization: Bearer $TOK" -H "Content-Type: application/vnd.api+json")
+          code=$(curl -sS -o /tmp/ws.json -w '%{http_code}' "${hdr[@]}" \
+            -d "{\"data\":{\"type\":\"workspaces\",\"attributes\":{\"name\":\"$WS\",\"execution-mode\":\"local\"}}}" \
+            "$api/organizations/$ORG/workspaces")
+          case "$code" in
+            201) echo "created workspace $WS" ;;
+            422) echo "workspace $WS already exists" ;;
+            *)   echo "::error::HCP answered $code"; cat /tmp/ws.json; exit 1 ;;
+          esac
+          # Execution mode must be Local: the plan has to run on this runner,
+          # because the Docker endpoint is only reachable through this run's
+          # certificate. A remote HCP runner has neither the route nor the key.
+          code=$(curl -sS -o /tmp/ws.json -w '%{http_code}' -X PATCH "${hdr[@]}" \
+            -d '{"data":{"type":"workspaces","attributes":{"execution-mode":"local"}}}' \
+            "$api/organizations/$ORG/workspaces/$WS")
+          [ "$code" = 200 ] || { echo "::error::could not set execution mode: $code"; cat /tmp/ws.json; exit 1; }
+
+      - name: generate the backend block
+        if: inputs.write_backend
+        run: |
+          set -euo pipefail
+          cat > backend.tf <<'EOF'
+          terraform {
+            cloud {}
+          }
+          EOF
+
+      - name: terraform init
+        run: terraform init -no-color
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      # ── plan ─────────────────────────────────────────────────────────────
+      - id: plan
+        name: terraform plan
+        run: |
+          set -euo pipefail
+          set +e
+          terraform plan -no-color -detailed-exitcode -out tfplan
+          rc=$?
+          set -e
+          echo "exitcode=$rc" >> "$GITHUB_OUTPUT"
+          case $rc in
+            0) echo "::notice::nothing to change" ;;
+            2) echo "::notice::changes pending" ;;
+            *) echo "::error::plan failed"; exit 1 ;;
+          esac
+
+      - name: terraform apply
+        if: steps.mode.outputs.mode == 'apply' && steps.plan.outputs.exitcode == '2'
+        run: terraform apply -no-color -auto-approve tfplan
+
+      # ── does it serve? ───────────────────────────────────────────────────
+      - id: probe
+        name: check the public URL answers
+        if: inputs.probe && steps.mode.outputs.mode == 'apply'
+        run: |
+          set -euo pipefail
+          url=$(terraform output -raw url)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+          # Containers need a moment and Caddy needs one health pass before it
+          # will route, so this retries. A probe without a retry is a flaky
+          # grader, which is worse than no grader.
+          code=000
+          for _ in $(seq 1 30); do
+            code=$(curl -sS -o /tmp/health -w '%{http_code}' "$url/health" || true)
+            [ "$code" = 200 ] && break
+            sleep 2
+          done
+          if [ "$code" != 200 ]; then
+            echo "::error title=Your stack did not answer::$url/health returned $code after 60 seconds. The containers started but nothing served. Check 'catshop-ps' and your proxy configuration."
+            exit 1
+          fi
+          echo "health: $(cat /tmp/health)"
+
+          # Several calls must not all land on one replica. This is what proves
+          # `count` built a pool rather than one container twice.
+          seen=$(for _ in $(seq 1 8); do curl -sS "$url/whoami"; echo; done | sort -u | wc -l)
+          echo "distinct replicas answering: $seen"
+          [ "$seen" -ge 2 ] || { echo "::error::every request hit the same replica"; exit 1; }
+
+      - name: applying twice changes nothing
+        if: steps.mode.outputs.mode == 'apply'
+        run: |
+          set -euo pipefail
+          set +e
+          terraform plan -no-color -detailed-exitcode
+          rc=$?
+          set -e
+          [ "$rc" = 0 ] || { echo "::error::a second plan still wants changes; this configuration is not convergent"; exit 1; }
+          echo "::notice::second plan is empty"
+
+      - name: drift, and the plan that notices it
+        if: inputs.drift_check && steps.mode.outputs.mode == 'apply'
+        run: |
+          set -euo pipefail
+          victim=$(docker ps --format '{{.Names}}' | grep -- '-app-0$' | head -1)
+          docker stop "$victim" >/dev/null
+          set +e
+          terraform plan -no-color -detailed-exitcode
+          rc=$?
+          set -e
+          [ "$rc" = 2 ] || { echo "::error::plan did not notice a stopped replica (exit $rc)"; exit 1; }
+          terraform apply -no-color -auto-approve
+          url=$(terraform output -raw url)
+          code=000
+          for _ in $(seq 1 30); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "$url/health" || true)
+            [ "$code" = 200 ] && break
+            sleep 2
+          done
+          [ "$code" = 200 ] || { echo "::error::the stack did not recover"; exit 1; }
+          echo "::notice::drift detected and repaired"
+
+      - name: summary
+        if: always()
+        working-directory: .
+        run: |
+          {
+            echo "### lab 4 · ${{ steps.mode.outputs.mode }}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| your space | \`${{ steps.cert.outputs.user }}\` |"
+            echo "| your URL | ${{ steps.cert.outputs.url }} |"
+            echo "| state | \`${{ inputs.hcp_org }}/${{ inputs.hcp_workspace }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: destroy
+        if: always() && inputs.destroy
+        run: terraform destroy -no-color -auto-approve || echo "::warning::destroy failed; the course reaper will collect it"
