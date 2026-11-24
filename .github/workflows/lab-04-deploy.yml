@@ -119,6 +119,15 @@ jobs:
     env:
       TF_IN_AUTOMATION: "1"
       TF_INPUT: "0"
+      # The docker provider opens a FRESH ssh session for every API call, so
+      # Terraform's default parallelism of 10 arrives at the course server as
+      # ten simultaneous logins — and the first thing that runs out is not CPU
+      # but the per-student process cap, which sshd reports as `exec request
+      # failed on channel 0` and the provider reports as your configuration
+      # being broken. Four at a time costs a few seconds and is honest.
+      TF_CLI_ARGS_plan: "-parallelism=4"
+      TF_CLI_ARGS_apply: "-parallelism=4"
+      TF_CLI_ARGS_destroy: "-parallelism=4"
       # An empty `cloud {}` block takes its organization and workspace from the
       # environment. That is what lets one configuration serve every student
       # without anyone editing a name into a file.
