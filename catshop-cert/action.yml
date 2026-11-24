@@ -160,6 +160,14 @@ runs:
             exit 0
           fi
           free=$(jq -r .free <<<"$out"); total=$(jq -r .total <<<"$out")
+          # total 0 means the server has no slot files at all, not that every
+          # slot is taken — /run is a tmpfs, so a reboot empties it. Treating
+          # that as "busy" would queue the whole class for the full timeout
+          # against a server that is completely idle.
+          if [ "${total:-0}" -eq 0 ]; then
+            echo "::warning::the server reports no deployment slots; going ahead without queueing"
+            exit 0
+          fi
           if [ "${free:-0}" -gt 0 ]; then
             echo "$free of $total deployment slots free - going ahead"
             exit 0
