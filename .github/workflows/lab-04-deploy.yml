@@ -152,7 +152,7 @@ jobs:
       # command, and can only reach this student's own engine.
       - id: cert
         name: prove who this run is, and get a one-hour certificate
-        uses: kse-ci-cd-basics-course/catshop-grader/catshop-cert@main
+        uses: kse-ci-cd-basics-course/catshop-grader/catshop-cert@v1
         with:
           signer: ${{ inputs.signer }}
 
