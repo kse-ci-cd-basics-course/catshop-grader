@@ -8,7 +8,6 @@
 #   config   the configuration judged from the files alone     required
 #   stack    the place really comes up, and really goes away   required
 #   drift    state against reality, and what plan notices      required
-#   pool     more than one copy, and something in front        bonus
 #
 # `config` touches nothing: no server, no certificate, no state backend, which
 # is what lets the course's own CI run it on every push against a known-good and
@@ -130,6 +129,21 @@ def var_default(name):
     return None
 
 
+def literal_password(body):
+    """A password that is typed rather than interpolated, in either shape.
+
+    Containers carry it in an environment string far more often than as an
+    attribute, and in that shape the quote comes BEFORE the word password:
+    "POSTGRES_PASSWORD=hunter2". A value containing $ is interpolating
+    something -- a variable, a random_password -- and passes.
+    """
+    if re.search(r'(?i)"[^"\n]*password[^"\n]{0,20}=\s*[^"$\n]{3,}"', body):
+        return True
+    if re.search(r'(?im)^\s*\w*password\w*\s*=\s*"[^"$\n]{3,}"', body):
+        return True
+    return False
+
+
 def two_of_them():
     """Two instances, however they were asked for.
 
@@ -148,7 +162,7 @@ def two_of_them():
     return len(singles) >= 2
 
 
-env = {"d": d, "re": re, "blocks": blocks, "resources": resources, "two_of_them": two_of_them,
+env = {"d": d, "re": re, "blocks": blocks, "resources": resources, "two_of_them": two_of_them, "literal_password": literal_password,
        "var_default": var_default,
        "body_of": body_of, "len": len, "any": any, "all": all, "sorted": sorted,
        "set": set, "str": str, "int": int, "sum": sum, "max": max}
@@ -345,9 +359,35 @@ stack_text_checks() {
     && ok "hcl:volume" "a docker_volume is declared" \
     || bad "hcl:volume" "no docker_volume — a volume is part of the place, and destroy has to take it away again"
 
-  tf_true "len(resources(r'^docker_container$')) >= 1" \
-    && ok "hcl:container" "a docker_container is declared" \
-    || bad "hcl:container" "no docker_container — there is nothing for the place to run"
+  # Three roles, and they are different kinds of thing: a database that keeps
+  # something, a pool of web copies that keep nothing, and a proxy that is the
+  # only one of the three anybody outside can reach.
+  tf_true "len(resources(r'^docker_container$')) >= 3" \
+    && ok "hcl:three-roles" "a database, a pool and a proxy are all declared" \
+    || bad "hcl:three-roles" "this lab wants three containers: a database, two web copies from one resource, and a proxy in front of them"
+
+  # One resource with count, never two blocks that happen to look alike. A
+  # hand-written pair cannot be raised to three without editing the file twice.
+  tf_true "any(re.search(r'(?m)^\\s*count\\s*=', b['body']) for b in resources(r'^docker_container$'))" \
+    && ok "hcl:count" "the web copies come from one resource with count" \
+    || bad "hcl:count" "no count on any container — two hand-written blocks are two resources that happen to look alike"
+
+  tf_true "any(re.search(r'postgres|mysql|mariadb', b['body'], re.I) for b in resources(r'^docker_(container|image)$'))" \
+    && ok "hcl:db" "a database is part of the place" \
+    || bad "hcl:db" "no database container — the place has nothing that remembers anything"
+
+  # The database must not be published. A proxy in front is the whole point of
+  # having a proxy, and a database on a host port is reachable by anything that
+  # can route to the box.
+  tf_true "all(re.search(r'(?m)^\\s*ports\\s*\\{', b['body']) is None for b in resources(r'^docker_container$') if re.search(r'postgres|mysql|mariadb', b['body'], re.I))" \
+    && ok "hcl:db-private" "the database publishes no port — it is reachable only on the network" \
+    || bad "hcl:db-private" "the database publishes a host port; only the proxy is allowed one, and the containers find each other by name on the docker_network"
+
+  # A literal password in a .tf file is in the history forever. var. or
+  # random_password both pass; a quoted constant does not.
+  tf_true "not any(literal_password(b['body']) for b in resources(r'^docker_container$'))" \
+    && ok "hcl:db-secret" "the database password is not a literal in the configuration" \
+    || bad "hcl:db-secret" "a password is typed into the configuration — take it from a variable or a random_password resource, and notice where it ends up in the state"
 
   tf_true "re.search(r'templatefile\\s*\\(', d['text']) is not None" \
     && ok "hcl:templatefile" "the server configuration is rendered, not pasted" \
@@ -384,6 +424,14 @@ stack_text_checks() {
     grep -qiE 'listen|location' "$TFDIR/nginx.conf.tftpl" \
       && ok "tpl:server" "the rendered file is a server configuration" \
       || bad "tpl:server" "nginx.conf.tftpl does not configure a server"
+    grep -qiE 'upstream[[:space:]]|proxy_pass' "$TFDIR/nginx.conf.tftpl" \
+      && ok "tpl:upstream" "an upstream pool and a proxy_pass rule are present" \
+      || bad "tpl:upstream" "no upstream / proxy_pass — nothing is balancing anything"
+    # A list the template walks is the difference between a pool that follows
+    # count and two lines that happen to be right today.
+    grep -qE '%\{[[:space:]]*for' "$TFDIR/nginx.conf.tftpl" \
+      && ok "tpl:generated" "the upstream list is generated from the resource" \
+      || bad "tpl:generated" "the upstream list does not loop — raise count and this file does not change"
   fi
   return 0
 }
@@ -405,7 +453,7 @@ section_config() {
 }
 
 section_stack() {
-  sect "section stack — the place really comes up"
+  sect "section stack — a proxy, two copies and a database"
 
   stack_text_checks || return
 
@@ -428,6 +476,36 @@ section_stack() {
     else
       bad "run:own-url" "$URL is not this repository owner's address — a place is graded at its own URL or not at all"
     fi
+  fi
+
+  # Separate connections, because keep-alive pins the client to whichever copy
+  # answered first and a correct pool then looks like one.
+  #
+  # This RETRIES for up to 45s, and that is not padding: a proxy with max_fails
+  # set will exclude a backend that failed once — including one that was merely
+  # slow to start — and let it back in after fail_timeout. Measured on a clean
+  # apply, every request hits one copy for the first ~30s and then settles to an
+  # even split, so a fixed loop fails a correct configuration.
+  local seen i who distinct=0 waited=0
+  while [ "$waited" -lt 45 ]; do
+    seen=""
+    for i in $(seq 1 12); do
+      # nginx answers /whoami with its own $hostname, one bare line. No JSON,
+      # because this lab has no application in it.
+      who=$(hit "$URL/whoami" | tr -d '\r' | head -1)
+      [ -n "$who" ] && seen="$seen$who"$'\n'
+    done
+    distinct=$(printf '%s' "$seen" | sort -u | grep -c . || true)
+    [ "${distinct:-0}" -ge 2 ] && break
+    sleep 5
+    waited=$((waited+5))
+  done
+  if [ "${distinct:-0}" -ge 2 ]; then
+    ok "run:replicas" "$distinct distinct copies answered (settled after ${waited}s)"
+  elif [ "${distinct:-0}" = 1 ]; then
+    bad "run:replicas" "every request reached the same copy — count is 1, or the upstream list has one entry in it"
+  else
+    bad "run:replicas" "/whoami returned nothing — is the proxy forwarding to the copies?"
   fi
 
   # ---- and whether anything was remembered ---------------------------------
@@ -500,18 +578,19 @@ section_drift() {
   fi
   ok "drift:target" "stopped $name by hand — Terraform was not told"
 
-  # With one container the place goes down, and that is the point: the machine
-  # changed and the state did not. A student who keeps serving here has either
-  # more than one container (which is the bonus, not this section) or something
-  # other than Terraform putting it back.
-  local i down=0
-  for i in $(seq 1 10); do
-    [ "$(code_of "$URL/health")" = "200" ] || down=$((down+1))
+  # With a pool in front, stopping one copy must NOT take the place down. That
+  # is the half of a load balancer nobody writes down: proxy_next_upstream, and
+  # a connect timeout short enough for the retry to happen inside the request.
+  # A stopped container refuses connections instantly, so this fails loudly
+  # when the retry is missing rather than being slow.
+  local i good=0
+  for i in $(seq 1 20); do
+    [ "$(code_of "$URL/health")" = "200" ] && good=$((good+1))
   done
-  if [ "$down" -ge 8 ]; then
-    ok "drift:reality-changed" "the URL stopped answering — the world moved and the state did not"
+  if [ "$good" -ge 18 ]; then
+    ok "drift:survives" "$good of 20 requests answered with one copy stopped"
   else
-    warn "drift:reality-changed" "the URL still answers with that container stopped; if you built the replica bonus, say so in the pull request"
+    bad "drift:survives" "$good of 20 answered — a stopped container refuses connections, and without proxy_next_upstream plus a short proxy_connect_timeout the retry never happens inside the request"
   fi
 
   # -detailed-exitcode: 0 no changes, 1 error, 2 changes. The wrapper that
@@ -573,91 +652,12 @@ print(n)')
 }
 
 
-# ── section: pool (bonus) ────────────────────────────────────────────────────
-#
-# The part of the lab that is worth marks but cannot cost them: do early what
-# the next lab needs. One resource with `count`, a proxy in front, and a
-# template whose upstream list comes from the resource rather than from typing.
-section_pool() {
-  sect "section pool — more than one of it, and something in front"
-
-  if ! read_tf "$TFDIR"; then
-    bad "tf:read" "no .tf files under $TFDIR/"
-    return
-  fi
-
-  tf_true "any(re.search(r'(?m)^\\s*count\\s*=', b['body']) for b in resources(r'^docker_container$'))" \
-    && ok "pool:count" "the copies come from one resource with count" \
-    || bad "pool:count" "two hand-written container blocks are two resources that happen to look alike"
-
-  if [ -f "$TFDIR/nginx.conf.tftpl" ]; then
-    grep -qiE 'upstream\s|proxy_pass' "$TFDIR/nginx.conf.tftpl" \
-      && ok "pool:upstream" "an upstream pool and a proxy_pass rule are present" \
-      || bad "pool:upstream" "no upstream / proxy_pass — nothing is balancing anything"
-    # A list the template walks is the difference between a pool that follows
-    # `count` and three lines that happen to be right today.
-    grep -qE '%\{[[:space:]]*for' "$TFDIR/nginx.conf.tftpl" \
-      && ok "pool:generated" "the upstream list is generated from the resource" \
-      || bad "pool:generated" "the pool does not loop — raise count and this file does not change"
-  fi
-
-  apply_stack || return
-  wait_for "$URL/health" 90 || { bad "pool:health" "nothing answered $URL/health"; return; }
-  ok "pool:health" "the pool answers through whatever is in front of it"
-
-  # Separate connections, because keep-alive pins the client to whichever
-  # backend answered first and a correct pool then looks like one copy. This
-  # retries: a proxy with max_fails excludes a backend that was merely slow to
-  # start, and lets it back in after fail_timeout.
-  local seen i who distinct=0 waited=0
-  while [ "$waited" -lt 45 ]; do
-    seen=""
-    for i in $(seq 1 12); do
-      who=$(hit "$URL/whoami" | tr -d '\r' | head -1)
-      [ -n "$who" ] && seen="$seen$who"$'\n'
-    done
-    distinct=$(printf '%s' "$seen" | sort -u | grep -c . || true)
-    [ "${distinct:-0}" -ge 2 ] && break
-    sleep 5
-    waited=$((waited+5))
-  done
-  if [ "${distinct:-0}" -ge 2 ]; then
-    ok "pool:replicas" "$distinct distinct copies answered (settled after ${waited}s)"
-  elif [ "${distinct:-0}" = 1 ]; then
-    bad "pool:replicas" "every request reached the same copy — one replica, or the pool has one entry"
-  else
-    bad "pool:replicas" "/whoami returned nothing — is the proxy forwarding to the copies?"
-  fi
-
-  # With a pool, stopping one copy must NOT take the place down. That is the
-  # half of a load balancer nobody writes down: proxy_next_upstream, and a
-  # connect timeout short enough for the retry to happen inside the request.
-  local addr name good=0
-  addr=$(terraform -chdir="$TFDIR" state list 2>/dev/null | grep '^docker_container\.' | grep '\[0\]' | head -1)
-  name=$(terraform -chdir="$TFDIR" state show "$addr" 2>/dev/null \
-         | sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' | head -1)
-  if [ -n "$name" ] && docker stop "$name" >/dev/null 2>&1; then
-    for i in $(seq 1 20); do
-      [ "$(code_of "$URL/health")" = "200" ] && good=$((good+1))
-    done
-    if [ "$good" -ge 18 ]; then
-      ok "pool:survives" "$good of 20 requests answered with one copy stopped"
-    else
-      bad "pool:survives" "$good of 20 answered — a stopped container refuses connections, and without proxy_next_upstream plus a short proxy_connect_timeout the retry never happens inside the request"
-    fi
-    tf "$TFDIR" apply -auto-approve -input=false -no-color >/dev/null 2>&1 || true
-  else
-    warn "pool:survives" "could not stop a copy to test failover"
-  fi
-}
-
 # ── run ──────────────────────────────────────────────────────────────────────
 if [ "$LIB" = 0 ]; then
   case "$SECTION" in
     config)     section_config ;;
     stack)      section_stack ;;
     drift)      section_drift ;;
-    pool)       section_pool ;;
   esac
   emit_report "$SECTION"
   [ "${BONUS:-0}" = 1 ] && exit 0

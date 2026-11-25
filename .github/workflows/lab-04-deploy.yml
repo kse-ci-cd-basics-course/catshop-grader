@@ -58,11 +58,11 @@ on:
         default: true
       min_replicas:
         description: >-
-          How many distinct copies must answer /whoami. The lab requires one;
-          set it to 2 if you built the pool bonus and want it checked.
+          How many distinct copies must answer /whoami. The lab requires two,
+          behind the proxy, from one resource with count.
         required: false
         type: number
-        default: 1
+        default: 2
       write_backend:
         description: >-
           Generate the `cloud {}` block instead of expecting one in the
@@ -260,9 +260,9 @@ jobs:
           fi
           echo "health: $(cat /tmp/health)"
 
-          # How many distinct copies answered. One is the lab's requirement; two
-          # or more is the pool bonus, and asserting it by default would fail a
-          # correct required solution.
+          # How many distinct copies answered. Two is the lab's requirement, and
+          # separate connections are the only way to see it: keep-alive pins the
+          # client to whichever copy answered first.
           seen=$(for _ in $(seq 1 8); do curl -sS "$url/whoami"; echo; done | sort -u | grep -c . || true)
           echo "distinct copies answering: $seen (need ${{ inputs.min_replicas }})"
           if [ "${seen:-0}" -lt "${{ inputs.min_replicas }}" ]; then
