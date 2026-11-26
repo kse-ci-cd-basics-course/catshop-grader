@@ -10,7 +10,7 @@ PASS=0; FAIL=0; WARN=0; RESULTS=()
 
 # G R Y D B N are the colours. A section that needs a variable must not use a
 # single capital letter, or its value lands in the middle of every log line.
-if [ -t 1 ] && [ "${JSON:-0}" = 0 ]; then
+if [ "${JSON:-0}" = 0 ]; then
   G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; B=$'\033[1m'; N=$'\033[0m'
 else
   G=; R=; Y=; D=; B=; N=
