@@ -103,8 +103,6 @@ run_image() {
 run_stack() {
   local target="${1:-}"
   sect "build and start the stack"
-  [ -f .env ] || { cp .env.example .env 2>/dev/null \
-    && warn "run:env" "no .env — copied .env.example for this run"; }
 
   if ! docker compose -f "$COMPOSE" build >/tmp/cb.$$ 2>&1; then
     bad "stack:build" "compose build failed"; tail -15 /tmp/cb.$$ >&2; return 1
@@ -131,6 +129,9 @@ check_compose_shape() {
   sect "compose, read"
   # a missing file is reported by the section's own need_file call; reporting it
   # here too would duplicate the check id and double-count the failure
+  [ -f .env ] || { cp .env.example .env 2>/dev/null \
+    && warn "run:env" "no .env — copied .env.example for this run"; }
+
   [ -f "$COMPOSE" ] || return
   docker compose -f "$COMPOSE" config -q >/dev/null 2>&1 \
     && ok "compose:valid" "$COMPOSE parses" \
